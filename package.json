@@ -1,0 +1,27 @@
+{
+  "name": "puppeteer",
+  "version": "1.0.0",
+  "description": "for the automation of web scraping",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "node",
+    "npm",
+    "puppeteer"
+  ],
+  "author": "erik white",
+  "license": "ISC",
+  "dependencies": {
+    "chrome-paths": "^1.0.1",
+    "dotenv": "^16.0.3",
+    "puppeteer": "npm:rebrowser-puppeteer@^24.0.0",
+    "puppeteer-extra": "^3.3.4",
+    "puppeteer-extra-plugin-adblocker": "^2.13.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.1",
+    "puppeteer-real-browser": "^1.4.2",
+    "random-number": "0.0.9",
+    "user-agents": "^1.0.1264"
+  }
+}
