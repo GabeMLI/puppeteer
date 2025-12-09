@@ -66,6 +66,12 @@ const isTruthy = (value = '') => {
     return [true, 'true'].includes(value);
 }
 
+// ----------------------------------------------------------------------
+// Small helpers to slow actions and add human-like timing
+const sleep = (ms = 300) => new Promise(resolve => setTimeout(resolve, ms));
+const randomBetween = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
+const humanPause = async (min = 120, max = 380) => sleep(randomBetween(min, max));
+
 async function log(msg = '', flag = 'a+') {
 
     try {
@@ -94,23 +100,34 @@ const timestamp = () => {
 
 const login = async (page) => {
 
-    await page.goto('https://www.healthsherpa.com/sessions/new');
+    await page.goto('https://www.healthsherpa.com/sessions/new', { waitUntil: 'domcontentloaded' });
 
     await page.waitForSelector('#username_or_email');
     await log('found username form field..');
-    await page.type('#username_or_email', process.env.USER_NAME);
+    await page.type('#username_or_email', process.env.USER_NAME, { delay: randomBetween(60, 120) });
+    await humanPause(150, 350);
 
     await page.waitForSelector('#password');
     await log('found password form field..');
-    await page.type('#password', process.env.PASSWORD);
+    await page.type('#password', process.env.PASSWORD, { delay: randomBetween(60, 120) });
+    await humanPause(200, 450);
 
     await page.waitForSelector('#login-submit-button');
     await log('logging in..');
 
-    // await page.waitForTimeout( 2000 );
-    new Promise(r => setTimeout(r, 2000));
+    await sleep(400 + randomBetween(100, 600));
 
-    return await page.click('#login-submit-button');
+    await page.click('#login-submit-button');
+
+    // Wait for navigation/network to settle a bit after clicking
+    try {
+        await Promise.race([
+            page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 }),
+            (async () => { await sleep(2000 + randomBetween(250, 800)); })(),
+        ]);
+    } catch (_) { /* ignore */ }
+
+    return;
 }
 
 const setFilters = async (page) => {
@@ -139,7 +156,8 @@ const setFilters = async (page) => {
         // https://www.healthsherpa.com/agents/tani-blum-_wxdza/enrollment_leads?_agent_id=tani-blum-_wxdza&renewal=all&exchange=onEx&include_shared_applications=true&per_page=50&page=1&enrollment_leads[archived]=not_archived&enrollment_leads[offEx]=false&enrollment_leads[exchange][]=onEx&enrollment_leads[sharedBook]=false&enrollment_leads[fullBook]=true&enrollment_leads[search]=true&term=&desc[]=lead_updated_at&agent_id=tani-blum-_wxdza
     } else {
         // -- Filters for Regular Client List ----------------------------------------------------------------------------------------
-        https://www.healthsherpa.com/agents/angel-arce-rvyoyq/clients?_agent_id=angel-arce-rvyoyq&ffm_applications[agent_archived]=not_archived&ffm_applications[search]=true&term=&renewal=all&desc[]=created_at&agent_id=angel-arce-rvyoyq&page=1&per_page=50&exchange=onEx&include_shared_applications=false&include_all_applications=false&states[]=AL
+        // Example URL for reference (commented to avoid syntax errors):
+        // https://www.healthsherpa.com/agents/angel-arce-rvyoyq/clients?_agent_id=angel-arce-rvyoyq&ffm_applications[agent_archived]=not_archived&ffm_applications[search]=true&term=&renewal=all&desc[]=created_at&agent_id=angel-arce-rvyoyq&page=1&per_page=50&exchange=onEx&include_shared_applications=false&include_all_applications=false&states[]=AL
 
         // extra_filters.push( 'per_page=' + process.env.PAGE_COUNT );
 
@@ -179,7 +197,7 @@ const setFilters = async (page) => {
     const full_url = `${base_url}${process.env.COMMON_FILTERS}&${filter_string}`;
     await log(full_url);
 
-    await page.goto(full_url);
+    await page.goto(full_url, { waitUntil: 'domcontentloaded' });
 
     return process.env.AGENT_NAME;
 }
@@ -193,7 +211,7 @@ const findFfmError = async (puppet_object) => {
         await log('FFM Renew Alert Detected..');
 
         // const closeButton = await puppet_object.$x( "//div[@style='position: absolute; top: 0px; right: 0px;']//button[contains(@aria-label,'Close') and text()-'X']" );
-        const closeButton = await puppet_object.$$("xpath/.//div[@style='position: absolute; top: 0px; right: 0px;']//button[contains(@aria-label,'Close') and text()-'X']");
+        const closeButton = await puppet_object.$$("xpath/.//div[@style='position: absolute; top: 0px; right: 0px;']//button[contains(@aria-label,'Close') and (text()='X' or contains(text(),'X'))]");
         await closeButton[0].click();
 
     } catch (e) {
@@ -239,6 +257,8 @@ const sherpaRefresh = async () => {
     //     defaultViewport: false
     // });
     const page = await browser.newPage();
+    page.setDefaultTimeout(30000);
+    page.setDefaultNavigationTimeout(30000);
 
     // console.log( chromePaths );
     // await page.waitForTimeout( 90000000000 );
@@ -306,7 +326,7 @@ const sherpaRefresh = async () => {
 
     await login(page);
 
-    await new Promise(r => setTimeout(r, 7500));
+    await sleep(300 + randomBetween(400, 900));
     // await page.waitForTimeout( 3000 );
 
     await findFfmError(page); // optionally close the "integrate your ffm" modal
@@ -437,6 +457,9 @@ const sherpaRefresh = async () => {
             }, '[aria-label="Go to next page"]');
 
             await nextButton.click();
+            // Give the SPA time to update results
+            await sleep(400 + randomBetween(500, 1100));
+            try { await page.waitForSelector('table', { timeout: 10000 }); } catch (_) { }
 
         } catch (e) {
 
@@ -498,7 +521,8 @@ const trimOpenPages = async (browser, main_page) => {
 
 const processTab = async (newTab, link, current_page, current_link) => {
 
-    await newTab.goto(link);
+    await newTab.goto(link, { waitUntil: 'domcontentloaded' });
+    await humanPause(250, 600);
 
     await findFfmError(newTab); // optionally close the "integrate your ffm" modal
 
