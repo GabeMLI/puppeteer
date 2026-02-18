@@ -61,6 +61,8 @@ const STATE_FLAGS = {
     FILTER_FOR_WYOMING: 'WY',
 };
 
+const RESULTS_CONTAINER_SELECTOR = '[role="grid"], .MuiDataGrid-main';
+
 const isTruthy = (value = '') => {
 
     return [true, 'true'].includes(value);
@@ -339,9 +341,9 @@ const sherpaRefresh = async () => {
     // -- Part 2, select each link ----------------------------------------------------------------
 
     // Wait for the table to be present on the page
-    await log('searching for table..');
+    await log('searching for results grid..');
     // await page.waitForTimeout( 90000000000 );
-    await page.waitForSelector('table');
+    await page.waitForSelector(RESULTS_CONTAINER_SELECTOR);
 
     const starting_page = process.env.STARTING_PAGE || 1;
     let current_page = 1; // DONT CHANGE THIS
@@ -367,7 +369,7 @@ const sherpaRefresh = async () => {
             // await page.waitForTimeout( 2500 );
 
             // Get all links from the current page
-            const links = await page.$$(`table a[href*="/agents/${agent}"]`);
+            const links = await page.$$(`${RESULTS_CONTAINER_SELECTOR} a[href*="/agents/${agent}"]`);
 
             // Use Set to store unique href values
             const uniqueLinksSet = new Set();
@@ -459,7 +461,7 @@ const sherpaRefresh = async () => {
             await nextButton.click();
             // Give the SPA time to update results
             await sleep(400 + randomBetween(500, 1100));
-            try { await page.waitForSelector('table', { timeout: 10000 }); } catch (_) { }
+            try { await page.waitForSelector(RESULTS_CONTAINER_SELECTOR, { timeout: 10000 }); } catch (_) { }
 
         } catch (e) {
 
