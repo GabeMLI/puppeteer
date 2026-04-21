@@ -1,5 +1,6 @@
 // const puppeteer = require( 'puppeteer' );
 const fs = require('node:fs/promises');
+const fsSync = require('node:fs');
 
 const { connect } = require("puppeteer-real-browser");
 
@@ -26,19 +27,105 @@ require('dotenv').config();
 
 const log_file_name = 'recorded-log.txt';
 
-const DEFAULT_BRAVE_PATHS = {
-    darwin: '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser',
-    linux: '/usr/bin/brave-browser',
-    win32: 'C:\\Program Files\\BraveSoftware\\Brave-Browser\\Application\\brave.exe',
+// Known install locations for Brave and Chrome across platforms.
+// Arrays are checked in order; the first path that exists on disk wins.
+const DEFAULT_BROWSER_PATHS = {
+    brave: {
+        darwin: [
+            '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser',
+        ],
+        linux: [
+            '/usr/bin/brave-browser',
+            '/usr/bin/brave',
+            '/snap/bin/brave',
+            '/opt/brave.com/brave/brave-browser',
+        ],
+        win32: [
+            'C:\\Program Files\\BraveSoftware\\Brave-Browser\\Application\\brave.exe',
+            'C:\\Program Files (x86)\\BraveSoftware\\Brave-Browser\\Application\\brave.exe',
+            `${process.env.LOCALAPPDATA || ''}\\BraveSoftware\\Brave-Browser\\Application\\brave.exe`,
+        ],
+    },
+    chrome: {
+        darwin: [
+            '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+            '/Applications/Google Chrome Beta.app/Contents/MacOS/Google Chrome Beta',
+            '/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary',
+            '/Applications/Chromium.app/Contents/MacOS/Chromium',
+        ],
+        linux: [
+            '/usr/bin/google-chrome',
+            '/usr/bin/google-chrome-stable',
+            '/usr/bin/chromium-browser',
+            '/usr/bin/chromium',
+            '/snap/bin/chromium',
+        ],
+        win32: [
+            'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+            'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+            `${process.env.LOCALAPPDATA || ''}\\Google\\Chrome\\Application\\chrome.exe`,
+        ],
+    },
 };
 
-const getBrowserExecutablePath = () => {
+const findFirstExistingPath = (paths = []) => {
 
-    const forcedPath = process.env.BROWSER_EXECUTABLE_PATH || process.env.BRAVE_PATH;
-    if (forcedPath) { return forcedPath; }
+    for (const candidate of paths) {
 
-    if (isTruthy(process.env.USE_BRAVE) || !process.env.BROWSER) {
-        return DEFAULT_BRAVE_PATHS[process.platform] || null;
+        if (!candidate) { continue; }
+
+        try {
+
+            if (fsSync.existsSync(candidate)) { return candidate; }
+
+        } catch (_) { /* ignore */ }
+    }
+
+    return null;
+}
+
+const detectBrowser = (name) => {
+
+    const byPlatform = DEFAULT_BROWSER_PATHS[name];
+    if (!byPlatform) { return null; }
+
+    return findFirstExistingPath(byPlatform[process.platform] || []);
+}
+
+/**
+ * Resolve which browser executable to launch.
+ * Returns { path, name } or null if nothing was found.
+ *
+ * Priority:
+ *   1. BROWSER_EXECUTABLE_PATH / BRAVE_PATH / CHROME_PATH (explicit override)
+ *   2. BROWSER env var ("brave" or "chrome") picks that one first, falls back to the other
+ *   3. USE_BRAVE=true prefers Brave, falls back to Chrome
+ *   4. Default: try Brave first, then Chrome
+ */
+const getBrowserExecutable = () => {
+
+    const forcedPath = process.env.BROWSER_EXECUTABLE_PATH
+        || process.env.BRAVE_PATH
+        || process.env.CHROME_PATH;
+
+    if (forcedPath) {
+        return { path: forcedPath, name: 'custom' };
+    }
+
+    const preference = (process.env.BROWSER || '').toLowerCase();
+    let order;
+    if (preference === 'chrome') {
+        order = ['chrome', 'brave'];
+    } else if (preference === 'brave' || isTruthy(process.env.USE_BRAVE)) {
+        order = ['brave', 'chrome'];
+    } else {
+        order = ['brave', 'chrome'];
+    }
+
+    for (const name of order) {
+
+        const path = detectBrowser(name);
+        if (path) { return { path, name }; }
     }
 
     return null;
@@ -247,12 +334,15 @@ const sherpaRefresh = async () => {
 
     await log('', 'w+'); // clears file
 
-    const browserExecutablePath = getBrowserExecutablePath();
-    const launcherConfig = browserExecutablePath ? { chromePath: browserExecutablePath } : {};
-    if (browserExecutablePath) {
-        await log(`Using browser executable: ${browserExecutablePath}`);
+    const detected = getBrowserExecutable();
+    const launcherConfig = detected ? { chromePath: detected.path } : {};
+    if (detected) {
+        const label = detected.name === 'custom'
+            ? 'custom'
+            : detected.name.charAt(0).toUpperCase() + detected.name.slice(1);
+        await log(`Detected ${label} browser at: ${detected.path}`);
     } else {
-        await log('Using default browser executable from puppeteer-real-browser.');
+        await log('No Brave or Chrome installation detected, falling back to puppeteer-real-browser default.');
     }
 
     const { browser } = await connect({
