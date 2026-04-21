@@ -83,6 +83,13 @@ const main = async () => {
             ? `Max pages to run: ${config.pagination.maxPagesToRun}`
             : 'No page limit specified..',
     );
+    logger.info(
+        `V8 heap ceiling: ${config.browser.maxOldSpaceMb} MB, ` +
+        `hard-reset at ${Math.round(config.memory.jsHeapBytesCritical / 1024 / 1024)} MB JS heap` +
+        (config.hardReset.everyNPages
+            ? ` or every ${config.hardReset.everyNPages} pages`
+            : ' (preventive cadence disabled)'),
+    );
 
     const { browser, page } = await launchBrowser({ logger, config });
     shutdownCtx.browser = browser;

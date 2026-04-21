@@ -128,12 +128,19 @@ const loadConfig = () => {
         readInt('MAX_OLD_SPACE_SIZE_MB', DEFAULT_MAX_OLD_SPACE_MB) || DEFAULT_MAX_OLD_SPACE_MB,
     );
 
-    // Critical heap threshold is always a fraction of V8's ceiling so it
+    // Critical heap threshold is normally a fraction of V8's ceiling so it
     // scales correctly when the user tunes MAX_OLD_SPACE_SIZE_MB. At 8 GB
     // ceiling this is 6 GB; at 16 GB ceiling it's 12 GB.
-    const jsHeapBytesCritical = Math.floor(
-        maxOldSpaceMb * 1024 * 1024 * MEMORY_THRESHOLDS.JS_HEAP_BYTES_CRITICAL_FRACTION,
-    );
+    //
+    // For debugging/testing, the operator can override it with an absolute
+    // value via JS_HEAP_CRITICAL_MB in .env. Useful to force a hard-reset
+    // to fire at, say, 1 GB to verify the recovery flow works end-to-end.
+    const jsHeapCriticalOverrideMb = readInt('JS_HEAP_CRITICAL_MB', null);
+    const jsHeapBytesCritical = jsHeapCriticalOverrideMb
+        ? jsHeapCriticalOverrideMb * 1024 * 1024
+        : Math.floor(
+            maxOldSpaceMb * 1024 * 1024 * MEMORY_THRESHOLDS.JS_HEAP_BYTES_CRITICAL_FRACTION,
+        );
 
     return Object.freeze({
         credentials: {
