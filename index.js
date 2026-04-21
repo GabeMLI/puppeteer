@@ -26,6 +26,24 @@ require('dotenv').config();
 
 const log_file_name = 'recorded-log.txt';
 
+const DEFAULT_BRAVE_PATHS = {
+    darwin: '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser',
+    linux: '/usr/bin/brave-browser',
+    win32: 'C:\\Program Files\\BraveSoftware\\Brave-Browser\\Application\\brave.exe',
+};
+
+const getBrowserExecutablePath = () => {
+
+    const forcedPath = process.env.BROWSER_EXECUTABLE_PATH || process.env.BRAVE_PATH;
+    if (forcedPath) { return forcedPath; }
+
+    if (isTruthy(process.env.USE_BRAVE) || !process.env.BROWSER) {
+        return DEFAULT_BRAVE_PATHS[process.platform] || null;
+    }
+
+    return null;
+}
+
 // ----------------------------------------------------------------------
 
 const STATE_FLAGS = {
@@ -62,79 +80,10 @@ const STATE_FLAGS = {
 };
 
 const RESULTS_CONTAINER_SELECTOR = '[role="grid"], .MuiDataGrid-main';
-const DEFAULT_MAC_BRAVE_PATH = '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser';
-const DEFAULT_MAC_CHROME_PATH = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
-const NEXT_PAGE_BUTTON_SELECTOR = [
-    'button[aria-label="Go to next page"]',
-    'button[title="Go to next page"]',
-].join(', ');
-
-const findNextPageButton = async (page, timeout = 10000) => {
-
-    try {
-
-        return await page.waitForSelector(NEXT_PAGE_BUTTON_SELECTOR, { timeout });
-
-    } catch (_) {
-
-        // Fallback by partial text in case labels vary slightly by locale
-        try {
-            const fallbackButtons = await page.$$("xpath/.//button[contains(@aria-label, 'next page') or contains(@title, 'next page')]");
-            return fallbackButtons?.[0] || null;
-        } catch (e) {
-            return null;
-        }
-    }
-}
 
 const isTruthy = (value = '') => {
 
     return [true, 'true'].includes(value);
-}
-
-const resolveChromePath = async () => {
-
-    const browser_candidates = [
-        process.env.BROWSER_PATH,
-        process.env.CHROME_PATH,
-        process.env.BRAVE_PATH,
-        process.platform === 'darwin' ? DEFAULT_MAC_CHROME_PATH : null,
-        process.platform === 'darwin' ? DEFAULT_MAC_BRAVE_PATH : null,
-    ].filter(Boolean);
-
-    for (const browser_path of browser_candidates) {
-
-        try {
-
-            await fs.access(browser_path);
-            return browser_path;
-
-        } catch (_) {
-
-            // continue trying next candidate path
-        }
-    }
-
-    return null;
-}
-
-const isBlankLikeUrl = (url = '') => {
-
-    const normalized_url = (url || '').trim().toLowerCase();
-    return normalized_url === '' || normalized_url === 'about:blank' || normalized_url.startsWith('chrome://newtab');
-}
-
-const safeClosePage = async (page_object) => {
-
-    try {
-
-        if (!page_object || page_object.isClosed()) { return; }
-        await page_object.close();
-
-    } catch (_) {
-
-        // fail silently
-    }
 }
 
 // ----------------------------------------------------------------------
@@ -298,15 +247,20 @@ const sherpaRefresh = async () => {
 
     await log('', 'w+'); // clears file
 
-    const browser_path = await resolveChromePath();
-    await log(browser_path ? `Using browser path: ${browser_path}` : 'No explicit browser path found. Using default launcher detection..');
+    const browserExecutablePath = getBrowserExecutablePath();
+    const launcherConfig = browserExecutablePath ? { chromePath: browserExecutablePath } : {};
+    if (browserExecutablePath) {
+        await log(`Using browser executable: ${browserExecutablePath}`);
+    } else {
+        await log('Using default browser executable from puppeteer-real-browser.');
+    }
 
     const { browser } = await connect({
 
         headless: false,
-        // executablePath  : chromePaths.chrome,
+        // chromePath: '/path/to/browser' is passed via customConfig (chrome-launcher)
         args: [],
-        customConfig: browser_path ? { chromePath: browser_path } : {},
+        customConfig: launcherConfig,
         turnstile: true,
         connectOption: {
             defaultViewport: null,
@@ -371,26 +325,29 @@ const sherpaRefresh = async () => {
     // Get all open pages
     let allPages = await browser.pages();
 
-    const selected_tab = allPages.find(open_tab => open_tab !== page) || null;
-    const iteration = selected_tab ? allPages.findIndex(open_tab => open_tab === selected_tab) : -1;
+    let selected_tab = null;
+    const page_count = allPages.length;
+    let iteration = 0;
+    while (!selected_tab) {
 
-    if (!selected_tab) {
+        if (allPages[iteration] != page) {
 
-        await log('No extra startup tab found. Continuing with main page..');
+            selected_tab = allPages[iteration];
 
-    } else {
+        } else {
 
-        await log(`Targeting First Blank Page: ${iteration}..`);
-        await selected_tab.bringToFront();
-
-        const on_main_page = (selected_tab == page);
-        await log(on_main_page ? 'Main Page detected, not closing..' : 'Closing Tab..');
-
-        if (!on_main_page) {
-
-            await selected_tab.close();
+            iteration++;
         }
+    }
+    await log(`Targeting First Blank Page: ${iteration}..`);
+    await selected_tab.bringToFront();
 
+    const on_main_page = (selected_tab == page);
+    await log(on_main_page ? 'Main Page detected, not closing..' : 'Closing Tab..');
+
+    if (!on_main_page) {
+
+        await selected_tab.close();
     }
 
     // -- Login -------------------------------------------------------------
@@ -512,18 +469,9 @@ const sherpaRefresh = async () => {
         try {
             // attempt to paginate..
 
-            const nextButton = await findNextPageButton(page, 10000);
-            if (!nextButton) {
+            const nextButton = await page.waitForSelector('[aria-label="Go to next page"]', { timeout: 10000 })
 
-                await log(`No Next Button Found on Page #${current_page}..`);
-                break;
-            }
-
-            const isDisabled = await page.evaluate(nextButton => {
-                return nextButton.classList.contains('Mui-disabled')
-                    || nextButton.disabled
-                    || nextButton.getAttribute('aria-disabled') === 'true';
-            }, nextButton);
+            const isDisabled = await page.evaluate(nextButton => nextButton.classList.contains('Mui-disabled'), nextButton);
             if (isDisabled) {
                 // if the button also is disabled, we are at the end and can break..
 
@@ -532,24 +480,18 @@ const sherpaRefresh = async () => {
             }
 
             // else continue to next page..
-            await nextButton.evaluate(button => {
-                button.scrollIntoView({ block: 'center', inline: 'center', behavior: 'auto' });
-            });
+            await page.evaluate(selector => {
+                document.querySelector(selector).scrollIntoView({ block: 'center', inline: 'center', behavior: 'auto' });
+            }, '[aria-label="Go to next page"]');
 
-            try {
-                await nextButton.click();
-            } catch (_) {
-                await nextButton.evaluate(button => button.click());
-            }
-
+            await nextButton.click();
             // Give the SPA time to update results
             await sleep(400 + randomBetween(500, 1100));
             try { await page.waitForSelector(RESULTS_CONTAINER_SELECTOR, { timeout: 10000 }); } catch (_) { }
 
         } catch (e) {
 
-            await log(`Pagination Error on Page #${current_page}..`);
-            await log(`ERROR MSG - ${e.message}`);
+            await log(`No Next Button Found on Page #${current_page}..`);
             break;
         }
     };
@@ -607,36 +549,7 @@ const trimOpenPages = async (browser, main_page) => {
 
 const processTab = async (newTab, link, current_page, current_link) => {
 
-    newTab.setDefaultTimeout(30000);
-    newTab.setDefaultNavigationTimeout(30000);
-
-    try {
-
-        await newTab.goto(link, { waitUntil: 'domcontentloaded', timeout: 30000 });
-
-        if (isBlankLikeUrl(newTab.url())) {
-
-            await log(`Blank page detected on first attempt for link #${current_link}. Retrying..`);
-
-            await newTab.goto(link, { waitUntil: 'networkidle2', timeout: 30000 });
-        }
-
-        if (isBlankLikeUrl(newTab.url())) {
-
-            throw new Error('Link opened as blank page after retry');
-        }
-
-    } catch (navigation_error) {
-
-        await log(`-- Navigation Error --`);
-        await log(`Link #${current_link} failed to open: ${link}`);
-        await log(`ERROR MSG - ${navigation_error.message}`);
-        await log('Closing failed tab and continuing..');
-        await safeClosePage(newTab);
-        await log('');
-        return false;
-    }
-
+    await newTab.goto(link, { waitUntil: 'domcontentloaded' });
     await humanPause(250, 600);
 
     await findFfmError(newTab); // optionally close the "integrate your ffm" modal
