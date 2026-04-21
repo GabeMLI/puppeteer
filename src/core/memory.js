@@ -1,7 +1,7 @@
 'use strict';
 
-const { detachInterception, attachInterception } = require('./browser');
-const { MEMORY_THRESHOLDS, CLEANUP, TIMEOUTS, SELECTORS } = require('../config/constants');
+const { detachInterception } = require('./browser');
+const { MEMORY_THRESHOLDS, CLEANUP } = require('../config/constants');
 
 /**
  * Human-readable memory size formatting for log lines.
@@ -61,27 +61,62 @@ const getPageJsHeapBytes = async (page) => {
 };
 
 /**
- * Ask the renderer to drop as much cached/unreferenced memory as possible
- * without losing cookies/session storage (so Google auth survives).
+ * In-place memory cleanup. Runs the renderer-side garbage collector and
+ * drops the HTTP cache via the DevTools Protocol *without* navigating,
+ * so we stay exactly where we are in the MUI pagination.
+ *
+ * This is the central OOM mitigation now that direct URL navigation to
+ * arbitrary page numbers is blocked by HealthSherpa — we cannot navigate
+ * to `about:blank` and back, so we lean on CDP to reclaim memory in situ.
+ *
+ * Cookies and sessionStorage are deliberately NOT touched — the Google
+ * auth session must survive every cleanup cycle.
  */
-const clearRendererCaches = async (page, { logger } = {}) => {
+const cleanupInPlace = async (page, { logger, label = 'cleanup' } = {}) => {
 
+    if (!page) { return; }
+
+    if (!(await isPageAccessible(page))) {
+
+        if (logger) { logger.warn(`[${label}] page not accessible, skipping cleanup.`); }
+        return;
+    }
+
+    let beforeHeap = 0;
     let client = null;
 
     try {
 
+        beforeHeap = await getPageJsHeapBytes(page);
+
         client = await page.target().createCDPSession();
 
-        // Heap GC first so the subsequent cache clears actually release bytes.
-        await client.send('HeapProfiler.collectGarbage').catch(() => {});
+        // Run the collector repeatedly — a single sweep rarely reclaims
+        // everything from a long-lived SPA (finalizers, weak references,
+        // etc. need multiple cycles).
+        for (let i = 0; i < 3; i++) {
+            await client.send('HeapProfiler.collectGarbage').catch(() => {});
+        }
+
+        // Drop the HTTP cache — gigabytes of cached assets accumulate here
+        // on long runs (MUI bundles, icons, JSON responses, etc.).
         await client.send('Network.clearBrowserCache').catch(() => {});
 
-        // Keep cookies (would break Google session) — intentionally NOT calling
-        // Network.clearBrowserCookies.
+        // Prune DOM internals the SPA might be holding onto: any detached
+        // DOM nodes kept alive only by React handlers. Safe best-effort.
+        await page.evaluate(() => {
+
+            if (typeof window === 'undefined') { return; }
+
+            // Hint the engine to release references. Has no effect without
+            // --js-flags=--expose-gc but is harmless when gc() is absent.
+            if (typeof window.gc === 'function') { try { window.gc(); } catch (_) { /* ignore */ } }
+
+        }).catch(() => {});
 
     } catch (err) {
 
-        if (logger) { logger.warn(`clearRendererCaches error: ${err.message}`); }
+        if (logger) { logger.warn(`[${label}] cleanupInPlace error: ${err.message}`); }
 
     } finally {
 
@@ -89,53 +124,16 @@ const clearRendererCaches = async (page, { logger } = {}) => {
             try { await client.detach(); } catch (_) { /* ignore */ }
         }
     }
-};
 
-/**
- * Navigate the main page to about:blank to drop its DOM/heap, then back
- * to the provided URL. Cookies (and therefore Google session) are preserved
- * because we never close the tab or the browser.
- *
- * This is the central mitigation for the "Aw, Snap! Out of Memory" error.
- */
-const softResetMainPage = async (page, url, { logger } = {}) => {
+    if (logger) {
 
-    if (!page) { return; }
-
-    if (logger) { logger.info(`-- Soft-resetting main page to free memory --`); }
-
-    try {
-
-        detachInterception(page);
-
-        await page.goto('about:blank', { waitUntil: 'domcontentloaded', timeout: TIMEOUTS.NAVIGATION })
-            .catch(() => {});
-
-        await clearRendererCaches(page, { logger });
-
-        await attachInterception(page);
-
-        if (url) {
-
-            await page.goto(url, { waitUntil: 'domcontentloaded', timeout: TIMEOUTS.NAVIGATION });
-
-            // Best-effort wait for the SPA grid to render. Ignore timeout —
-            // the caller can handle missing selectors.
-            try {
-                await page.waitForSelector(SELECTORS.RESULTS_CONTAINER, { timeout: TIMEOUTS.RESULTS_GRID });
-            } catch (_) { /* ignore */ }
-        }
-
-        if (logger) {
-
-            const afterHeap = await getPageJsHeapBytes(page);
-            const rss = process.memoryUsage().rss;
-            logger.info(`-- Soft-reset done: RSS=${formatBytes(rss)} heap=${formatBytes(afterHeap)} --`);
-        }
-
-    } catch (err) {
-
-        if (logger) { logger.error(`softResetMainPage failed: ${err.message}`); }
+        const afterHeap = await getPageJsHeapBytes(page);
+        const rss = process.memoryUsage().rss;
+        const delta = beforeHeap - afterHeap;
+        const deltaStr = delta > 0 ? `-${formatBytes(delta)}` : `+${formatBytes(-delta)}`;
+        logger.info(
+            `[${label}] RSS=${formatBytes(rss)} heap=${formatBytes(afterHeap)} (${deltaStr})`,
+        );
     }
 };
 
@@ -210,8 +208,7 @@ const trimOrphanTabs = async (browser, mainPage, { logger } = {}) => {
 };
 
 module.exports = {
-    softResetMainPage,
-    clearRendererCaches,
+    cleanupInPlace,
     sampleMemory,
     trimOrphanTabs,
     isPageAccessible,

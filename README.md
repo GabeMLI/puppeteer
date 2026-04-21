@@ -49,29 +49,37 @@ src/
 The previous implementation crashed with
 `Aw, Snap! Out of Memory` after several hours, because:
 
-1. It navigated results pages by **clicking "Next page" N times** on the same
-   MUI DataGrid. The HealthSherpa SPA accumulated DOM, cached rows, analytics,
-   images, and trackers until the renderer ran out of memory.
-2. **Request interception was only applied to the main page** — every new tab
-   re-downloaded images, fonts, analytics, trackers, etc.
+1. It navigated results pages by clicking "Next page" N times on the same
+   MUI DataGrid, accumulating DOM, cached rows, analytics, images, and
+   trackers until the renderer ran out of memory.
+2. **Request interception was only applied to the main page** — every new
+   tab re-downloaded images, fonts, analytics, trackers, etc.
 3. Browser cache was never cleared.
 4. Orphan tabs and listener closures leaked between iterations.
 
-The mitigations in this version, all of which preserve cookies so the Google
-auth session is never lost:
+HealthSherpa blocks deep-linking to arbitrary page numbers via URL, so
+we still have to click "Next page" to advance. The mitigations in this
+version — all of which preserve cookies so the Google auth session is
+never lost — are:
 
-- **URL-based pagination** — `src/flows/pagination.js::gotoPage` navigates
-  directly to `&page=N`, eliminating the accumulation entirely.
+- **In-place memory cleanup via CDP** — `src/core/memory.js::cleanupInPlace`
+  runs `HeapProfiler.collectGarbage` three times and
+  `Network.clearBrowserCache` through the DevTools Protocol without
+  navigating anywhere. Cookies and sessionStorage are left untouched.
+- **Cleanup during the skip-forward phase** — when the bot starts with
+  `STARTING_PAGE=160` it must click Next 159 times before processing
+  anything. `skipToStartingPage` invokes `cleanupInPlace` every N pages
+  (default 20) so the grid's heap never reaches the OOM ceiling during
+  the skip.
 - **Global request interception** — `src/core/browser.js` attaches a
-  `targetcreated` listener so every new tab blocks `image`, `media`, `font`,
-  plus a curated tracker/analytics domain blocklist.
-- **Soft reset of the main page** — `src/core/memory.js::softResetMainPage`
-  navigates to `about:blank`, runs `HeapProfiler.collectGarbage` and
-  `Network.clearBrowserCache` via CDP, then returns to the current page URL.
-  Cookies are intentionally **not** cleared.
-- **Memory watchdog** — `sampleMemory()` checks process RSS and JS heap every
-  `SAMPLE_EVERY_N_LINKS` links and triggers a soft reset when thresholds
-  (default 1.5 GB RSS / 500 MB JS heap) are exceeded.
+  `targetcreated` listener so every new tab blocks `image`, `media`,
+  `font`, plus a curated tracker/analytics domain blocklist.
+- **Memory watchdog** — `sampleMemory()` checks process RSS and JS heap
+  every `SAMPLE_EVERY_N_LINKS` links and runs an extra cleanup when
+  thresholds (default 1.5 GB RSS / 500 MB JS heap) are exceeded.
+- **Scheduled cleanup** — once per `SOFT_RESET_EVERY_N_PAGES` pages the
+  bot runs `cleanupInPlace` unconditionally, so the renderer's heap
+  doesn't drift upward over long runs.
 - **Tab hygiene** — `trimOrphanTabs` sweeps stray tabs every
   `TRIM_ORPHAN_TABS_EVERY_N_LINKS` links, and each processing tab is
   disposed with `detachInterception` → `about:blank` → `close`.

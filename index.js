@@ -6,27 +6,46 @@
  * High-level flow:
  *   1. Launch Brave/Chrome via puppeteer-real-browser (see src/core/browser.js)
  *   2. Log in (operator completes the Google auth code manually — see README)
- *   3. Visit the filtered list page once to warm up the session
- *   4. For each page N starting at STARTING_PAGE, navigate DIRECTLY to
- *      that page via URL (no "Next" button clicks) and process its links
- *   5. Periodically trim orphan tabs, sample memory, and soft-reset the
- *      main page when thresholds are exceeded — never closing the browser,
- *      so the Google auth session is preserved.
+ *   3. Visit the filtered list page once (this lands us on page 1)
+ *   4. Click "Next page" until we reach STARTING_PAGE, running in-place
+ *      memory cleanup every N clicks so the skip phase doesn't OOM
+ *   5. For each page from there on, process its links and then click
+ *      "Next page" to advance. HealthSherpa blocks deep-linking to
+ *      arbitrary page numbers via URL, so click-based pagination is the
+ *      only option.
+ *   6. Periodically trim orphan tabs and run in-place memory cleanup
+ *      when process RSS / JS heap cross their thresholds. We never
+ *      navigate away from the main page, so the Google auth session
+ *      is preserved through every cleanup cycle.
  *
- * See docs/architecture.md and src/config/constants.js for tunables.
+ * See src/config/constants.js for tunables.
  */
 
 const { loadConfig } = require('./src/config/env');
 const { Logger } = require('./src/core/logger');
 const { launchBrowser } = require('./src/core/browser');
 const { installShutdownHandlers } = require('./src/core/shutdown');
-const { softResetMainPage, sampleMemory } = require('./src/core/memory');
+const { cleanupInPlace, sampleMemory, trimOrphanTabs } = require('./src/core/memory');
 const { MEMORY_THRESHOLDS } = require('./src/config/constants');
 
 const { login } = require('./src/flows/login');
 const { visitFilters } = require('./src/flows/filters');
-const { gotoPage, urlForPage, isOnLastPage } = require('./src/flows/pagination');
+const { gotoNextPage, skipToStartingPage, isOnLastPage } = require('./src/flows/pagination');
 const { processCurrentPage } = require('./src/flows/processPage');
+
+const runMemoryCheck = async ({ mainPage, logger, label }) => {
+
+    const sample = await sampleMemory(mainPage);
+    logger.info(`[memory] ${label}: RSS=${sample.formatted.rss} heap=${sample.formatted.jsHeap}`);
+
+    if (sample.exceeded) {
+        logger.warn(`[memory] threshold exceeded, running in-place cleanup.`);
+        await cleanupInPlace(mainPage, { logger, label: `threshold-${label}` });
+        return true;
+    }
+
+    return false;
+};
 
 const main = async () => {
 
@@ -63,23 +82,35 @@ const main = async () => {
     });
 
     // After login the operator may need to manually input the Google auth
-    // code. We don't race the results grid here — we just proceed to
-    // the filtered URL, which will redirect to auth if required.
+    // code before the filtered list renders.
     await visitFilters(page, config, { logger });
 
     const { startingPage, maxPagesToRun } = config.pagination;
-    let currentPage = startingPage;
 
+    // -- Skip-forward phase ------------------------------------------------
+    // With STARTING_PAGE=160 this is 159 consecutive Next clicks. We run
+    // in-place memory cleanup every N pages during the skip so the grid's
+    // accumulated state never reaches the OOM threshold.
+    const arrivedAt = await skipToStartingPage(page, startingPage, {
+        logger,
+        intervalPages: MEMORY_THRESHOLDS.SOFT_RESET_EVERY_N_PAGES,
+        onInterval: async (pageJustReached) => {
+            await cleanupInPlace(page, { logger, label: `skip-${pageJustReached}` });
+            await trimOrphanTabs(browser, page, { logger });
+        },
+    });
+
+    if (arrivedAt !== startingPage) {
+        logger.warn(`Could not reach STARTING_PAGE=${startingPage}; stopped at ${arrivedAt}.`);
+    }
+
+    let currentPage = arrivedAt;
+
+    // -- Processing phase --------------------------------------------------
     while (true) {
 
         if (maxPagesToRun && state.pagesRan >= maxPagesToRun) {
             logger.info(`Reached NUMBER_PAGES_TO_RUN=${maxPagesToRun}, stopping.`);
-            break;
-        }
-
-        const gridLoaded = await gotoPage(page, currentPage, config, { logger });
-        if (!gridLoaded) {
-            logger.warn(`Could not load results grid on page #${currentPage}, stopping.`);
             break;
         }
 
@@ -94,23 +125,26 @@ const main = async () => {
 
         state.pagesRan++;
 
-        // Preventive soft reset on a fixed cadence — even if thresholds
-        // haven't been hit, long-lived SPA state accumulates slowly.
+        // Scheduled in-place cleanup even when thresholds aren't hit, to
+        // keep the renderer's heap from drifting upward over long runs.
         if (state.pagesRan % MEMORY_THRESHOLDS.SOFT_RESET_EVERY_N_PAGES === 0) {
-            const sample = await sampleMemory(page);
-            logger.info(`[memory] scheduled check after ${state.pagesRan} pages: RSS=${sample.formatted.rss} heap=${sample.formatted.jsHeap}`);
-            await softResetMainPage(page, urlForPage(config, currentPage), { logger });
+            await cleanupInPlace(page, { logger, label: `scheduled-p${currentPage}` });
+        } else {
+            // Light-touch check after every page — logs the memory trend
+            // and triggers cleanup only if thresholds are breached.
+            await runMemoryCheck({ mainPage: page, logger, label: `p${currentPage}` });
         }
 
-        if (linkCount === 0) {
+        if (linkCount === 0 && (await isOnLastPage(page))) {
+            logger.info(`Page #${currentPage} appears to be the last one, stopping.`);
+            break;
+        }
 
-            // No links could mean we're past the last page of results.
-            if (await isOnLastPage(page)) {
-                logger.info(`Page #${currentPage} appears to be the last one, stopping.`);
-                break;
-            }
-
-            logger.warn(`Page #${currentPage} returned 0 links but 'Next' is enabled, continuing.`);
+        // Advance to the next page via click.
+        const advanced = await gotoNextPage(page, { logger });
+        if (!advanced) {
+            logger.info(`Could not advance past page #${currentPage}, stopping.`);
+            break;
         }
 
         currentPage++;
