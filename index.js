@@ -72,7 +72,7 @@ const main = async () => {
             : 'No page limit specified..',
     );
 
-    const { browser, page } = await launchBrowser({ logger });
+    const { browser, page } = await launchBrowser({ logger, config });
     shutdownCtx.browser = browser;
 
     await login(page, {
@@ -93,7 +93,9 @@ const main = async () => {
     // accumulated state never reaches the OOM threshold.
     const arrivedAt = await skipToStartingPage(page, startingPage, {
         logger,
-        intervalPages: MEMORY_THRESHOLDS.SOFT_RESET_EVERY_N_PAGES,
+        // intervalPages defaults to SKIP_CLEANUP_EVERY_N_PAGES — pass it
+        // explicitly to make the cadence obvious in this call site.
+        intervalPages: MEMORY_THRESHOLDS.SKIP_CLEANUP_EVERY_N_PAGES,
         onInterval: async (pageJustReached) => {
             await cleanupInPlace(page, { logger, label: `skip-${pageJustReached}` });
             await trimOrphanTabs(browser, page, { logger });
@@ -127,7 +129,7 @@ const main = async () => {
 
         // Scheduled in-place cleanup even when thresholds aren't hit, to
         // keep the renderer's heap from drifting upward over long runs.
-        if (state.pagesRan % MEMORY_THRESHOLDS.SOFT_RESET_EVERY_N_PAGES === 0) {
+        if (state.pagesRan % MEMORY_THRESHOLDS.CLEANUP_EVERY_N_PAGES === 0) {
             await cleanupInPlace(page, { logger, label: `scheduled-p${currentPage}` });
         } else {
             // Light-touch check after every page — logs the memory trend

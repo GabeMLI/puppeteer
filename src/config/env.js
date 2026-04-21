@@ -2,7 +2,7 @@
 
 require('dotenv').config();
 
-const { STATE_FLAGS } = require('./constants');
+const { STATE_FLAGS, DEFAULT_MAX_OLD_SPACE_MB } = require('./constants');
 
 const isTruthy = (value) => {
     if (value === true) { return true; }
@@ -107,9 +107,26 @@ const buildFilterPieces = () => {
     };
 };
 
+const parseFlagList = (raw) => {
+
+    if (!raw) { return []; }
+
+    // Accept comma or newline separated flags, each optionally starting with "--".
+    return raw
+        .split(/[,\n]+/)
+        .map((flag) => flag.trim())
+        .filter(Boolean)
+        .map((flag) => (flag.startsWith('--') ? flag : `--${flag}`));
+};
+
 const loadConfig = () => {
 
     const { baseUrl, commonFilters, extraFilters, botMode } = buildFilterPieces();
+
+    const maxOldSpaceMb = Math.max(
+        1024,
+        readInt('MAX_OLD_SPACE_SIZE_MB', DEFAULT_MAX_OLD_SPACE_MB) || DEFAULT_MAX_OLD_SPACE_MB,
+    );
 
     return Object.freeze({
         credentials: {
@@ -129,6 +146,10 @@ const loadConfig = () => {
             baseUrl,
             commonFilters,
             extraFilters,
+        },
+        browser: {
+            maxOldSpaceMb,
+            extraFlags: parseFlagList(readString('EXTRA_BROWSER_FLAGS', '')),
         },
     });
 };

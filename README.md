@@ -77,9 +77,28 @@ never lost — are:
 - **Memory watchdog** — `sampleMemory()` checks process RSS and JS heap
   every `SAMPLE_EVERY_N_LINKS` links and runs an extra cleanup when
   thresholds (default 1.5 GB RSS / 500 MB JS heap) are exceeded.
-- **Scheduled cleanup** — once per `SOFT_RESET_EVERY_N_PAGES` pages the
+- **Scheduled cleanup** — once per `CLEANUP_EVERY_N_PAGES` pages the
   bot runs `cleanupInPlace` unconditionally, so the renderer's heap
   doesn't drift upward over long runs.
+- **Raised V8 heap ceiling** — `--js-flags=--max-old-space-size=N` raises
+  Chromium's per-renderer heap limit from the default 2-4 GB to 8 GB
+  (configurable via `MAX_OLD_SPACE_SIZE_MB`). Switching to Edge/Chrome
+  instead of Brave would not help — they all share the same V8 engine
+  with the same default ceiling.
+- **Background-throttling disabled** — `--disable-renderer-backgrounding`,
+  `--disable-background-timer-throttling` and friends stop Chromium from
+  pausing the tab when it loses focus, which otherwise makes MUI timers
+  stall and Next-click waits time out.
+- **HTTP cache disabled globally** — via `Network.setCacheDisabled` on
+  every tab, so the cache can never accumulate gigabytes of MUI bundles
+  and JSON responses during a multi-hour session.
+- **Per-origin storage wipe** — each `cleanupInPlace` also calls
+  `Storage.clearDataForOrigin` with `cache_storage,shader_cache,service_workers,websql,file_systems,appcache`
+  (cookies and localStorage are deliberately preserved).
+- **Click retry with cleanup** — when the "Next page" click fails to
+  re-render the grid (classic symptom of an imminent OOM), the bot runs
+  a full `cleanupInPlace`, waits, and retries up to 3 times before
+  giving up.
 - **Tab hygiene** — `trimOrphanTabs` sweeps stray tabs every
   `TRIM_ORPHAN_TABS_EVERY_N_LINKS` links, and each processing tab is
   disposed with `detachInterception` → `about:blank` → `close`.
@@ -100,6 +119,8 @@ can be tuned without touching the flow code.
 | `NUMBER_PAGES_TO_RUN`      | Empty = run forever; otherwise stop after N pages                                                |
 | `BROWSER`                  | `brave` or `chrome` (default preference order)                                                   |
 | `BROWSER_EXECUTABLE_PATH`  | Full override path to the browser binary                                                         |
+| `MAX_OLD_SPACE_SIZE_MB`    | V8 heap ceiling per renderer (default `8192`). Raise on machines with 32 GB+ RAM, lower on 8 GB  |
+| `EXTRA_BROWSER_FLAGS`      | Comma-separated extra Chromium launch flags                                                      |
 | `FILTER_*`, `STATE_*`      | Result filters — see `.env.example` for the full catalogue                                       |
 
 `.env.example` documents every option and is kept in sync with the code.

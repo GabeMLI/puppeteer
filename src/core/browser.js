@@ -7,6 +7,8 @@ const {
     TIMEOUTS,
     BLOCKED_RESOURCE_TYPES,
     BLOCKED_URL_PATTERNS,
+    DEFAULT_BROWSER_FLAGS,
+    DEFAULT_MAX_OLD_SPACE_MB,
 } = require('../config/constants');
 
 /**
@@ -24,6 +26,28 @@ const shouldBlockRequest = (request) => {
     }
 
     return false;
+};
+
+/**
+ * Disable the HTTP cache for a page via CDP. This is a big long-run memory
+ * win: browsers hold tens-to-hundreds of MB of MUI bundles, icons, JSON
+ * responses, etc. in the disk+memory HTTP cache during a multi-hour session.
+ * With caching disabled, the cache never grows in the first place.
+ *
+ * Cookies and sessionStorage/localStorage are untouched, so the Google auth
+ * session survives intact.
+ */
+const disableHttpCache = async (page) => {
+
+    try {
+
+        const client = await page.target().createCDPSession();
+        await client.send('Network.enable').catch(() => {});
+        await client.send('Network.setCacheDisabled', { cacheDisabled: true }).catch(() => {});
+        // Intentionally leave the session attached — detaching re-enables cache.
+        page.__hsCdpSession = client;
+
+    } catch (_) { /* ignore */ }
 };
 
 /**
@@ -67,6 +91,8 @@ const attachInterception = async (page) => {
         page.setDefaultTimeout(TIMEOUTS.DEFAULT);
         page.setDefaultNavigationTimeout(TIMEOUTS.NAVIGATION);
 
+        await disableHttpCache(page);
+
     } catch (err) {
 
         // If interception fails (target already closed etc.), don't crash.
@@ -92,8 +118,44 @@ const detachInterception = (page) => {
 
     } catch (_) { /* ignore */ }
 
+    // Detach the CDP session held for cache control, if any.
+    if (page.__hsCdpSession) {
+        try { page.__hsCdpSession.detach().catch(() => {}); } catch (_) { /* ignore */ }
+        page.__hsCdpSession = null;
+    }
+
     page.__hsInterceptionHandler = null;
     page.__hsInterceptionAttached = false;
+};
+
+/**
+ * Build the full Chromium launch args array from the defaults, the
+ * V8 heap ceiling, and any extra user-provided flags from .env.
+ *
+ * Notes on the flags we use (see src/config/constants.js::DEFAULT_BROWSER_FLAGS):
+ *   --js-flags=--max-old-space-size=N raises V8's heap ceiling per renderer
+ *   (default ~2-4 GB). This is the most impactful flag for OOM on long runs.
+ *   --disable-backgrounding-occluded-windows / --disable-renderer-backgrounding
+ *   / --disable-background-timer-throttling stop Chromium from pausing the
+ *   tab when focus moves elsewhere — otherwise MUI timers stall and our
+ *   Next-click waits time out.
+ */
+const buildLaunchArgs = (browserConfig = {}) => {
+
+    const maxOldSpaceMb = Number.isFinite(browserConfig.maxOldSpaceMb) && browserConfig.maxOldSpaceMb > 0
+        ? browserConfig.maxOldSpaceMb
+        : DEFAULT_MAX_OLD_SPACE_MB;
+
+    const args = [
+        ...DEFAULT_BROWSER_FLAGS,
+        `--js-flags=--max-old-space-size=${maxOldSpaceMb}`,
+    ];
+
+    if (Array.isArray(browserConfig.extraFlags) && browserConfig.extraFlags.length) {
+        args.push(...browserConfig.extraFlags);
+    }
+
+    return args;
 };
 
 /**
@@ -102,7 +164,7 @@ const detachInterception = (page) => {
  *
  * Returns { browser, page, executable }.
  */
-const launchBrowser = async ({ logger } = {}) => {
+const launchBrowser = async ({ logger, config = {} } = {}) => {
 
     const detected = getBrowserExecutable();
     const launcherConfig = detected ? { chromePath: detected.path } : {};
@@ -118,9 +180,16 @@ const launchBrowser = async ({ logger } = {}) => {
         }
     }
 
+    const launchArgs = buildLaunchArgs(config.browser);
+
+    if (logger) {
+        logger.info(`Launching Chromium with flags:`);
+        for (const flag of launchArgs) { logger.info(`  ${flag}`); }
+    }
+
     const { browser } = await connect({
         headless: false,
-        args: [],
+        args: launchArgs,
         customConfig: launcherConfig,
         turnstile: true,
         connectOption: { defaultViewport: null },

@@ -109,13 +109,31 @@ const BLOCKED_URL_PATTERNS = Object.freeze([
     'licdn.com/px',
 ]);
 
-// Memory watchdog thresholds — when exceeded, trigger softResetMainPage.
+// Memory watchdog thresholds — when exceeded, run cleanupInPlace.
 const MEMORY_THRESHOLDS = Object.freeze({
     RSS_BYTES: 1_500 * 1024 * 1024,           // 1.5 GB process RSS
     JS_HEAP_BYTES: 500 * 1024 * 1024,          // 500 MB JS heap on main tab
-    SAMPLE_EVERY_N_LINKS: 10,                  // how often to sample
-    SOFT_RESET_EVERY_N_PAGES: 20,              // forced reset cadence
+    SAMPLE_EVERY_N_LINKS: 10,                  // how often to sample memory during link processing
+    CLEANUP_EVERY_N_PAGES: 20,                 // scheduled cleanup cadence during processing phase
+    // Skip phase is the most memory-hostile one (159 rapid clicks back-to-back
+    // with no time to breathe). Everything here is intentionally more aggressive.
+    SKIP_CLEANUP_EVERY_N_PAGES: 5,
+    SKIP_CLICK_DELAY_MIN_MS: 2_000,
+    SKIP_CLICK_DELAY_MAX_MS: 3_500,
 });
+
+// Retry behaviour when the "Next page" click fails to re-render the grid.
+// This is our last-chance safety net before concluding we're stuck — we do
+// one more cleanup pass, wait a moment, then try once more.
+const PAGE_RETRY = Object.freeze({
+    ATTEMPTS: 3,
+    BETWEEN_ATTEMPTS_MS: 5_000,
+});
+
+// Storage types safe to clear on healthsherpa.com origin without killing the
+// Google auth session. `cookies` and `local_storage` are deliberately omitted.
+// `indexeddb` is also omitted as a precaution — some OAuth libraries use it.
+const STORAGE_TYPES_TO_CLEAR = 'cache_storage,shader_cache,service_workers,websql,file_systems,appcache';
 
 // Cleanup / trimming cadence
 const CLEANUP = Object.freeze({
@@ -128,6 +146,29 @@ const CLEANUP = Object.freeze({
 
 const LOG_FILE_NAME = 'recorded-log.txt';
 
+// -----------------------------------------------------------------------
+// Chromium launch tuning.
+//
+// V8's per-renderer heap defaults to ~2-4 GB regardless of how much RAM the
+// machine has. We explicitly raise it so the HealthSherpa SPA has headroom
+// to grow before the OOM ceiling is hit. Switching to Edge/Brave/Chrome
+// doesn't help here — they all share the same V8 engine and the same limit.
+const DEFAULT_MAX_OLD_SPACE_MB = 8192;
+
+// Flags that make the Chromium renderer more predictable for a long-running
+// automation session. None of these compromise the visible UX, but they
+// avoid subtle failures (e.g. MUI timers pausing when the window loses
+// focus, making Next-click waits time out).
+const DEFAULT_BROWSER_FLAGS = Object.freeze([
+    '--disable-backgrounding-occluded-windows',
+    '--disable-renderer-backgrounding',
+    '--disable-background-timer-throttling',
+    '--disable-ipc-flooding-protection',
+    '--disable-hang-monitor',
+    '--disable-breakpad',
+    '--disable-features=IsolateOrigins,site-per-process,TranslateUI',
+]);
+
 module.exports = {
     STATE_FLAGS,
     SELECTORS,
@@ -135,6 +176,10 @@ module.exports = {
     BLOCKED_RESOURCE_TYPES,
     BLOCKED_URL_PATTERNS,
     MEMORY_THRESHOLDS,
+    PAGE_RETRY,
+    STORAGE_TYPES_TO_CLEAR,
     CLEANUP,
     LOG_FILE_NAME,
+    DEFAULT_MAX_OLD_SPACE_MB,
+    DEFAULT_BROWSER_FLAGS,
 };

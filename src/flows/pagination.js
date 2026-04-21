@@ -1,7 +1,8 @@
 'use strict';
 
-const { SELECTORS, TIMEOUTS } = require('../config/constants');
+const { SELECTORS, TIMEOUTS, PAGE_RETRY, MEMORY_THRESHOLDS } = require('../config/constants');
 const { sleep, randomBetween } = require('../core/timing');
+const { cleanupInPlace, logPageDiagnostics } = require('../core/memory');
 
 /**
  * Detect whether the current page is the last one by checking the
@@ -27,14 +28,10 @@ const isOnLastPage = async (page) => {
 };
 
 /**
- * Click the "Next page" button of the MUI DataGrid and wait for the
- * results grid to re-render. HealthSherpa blocks deep-linking to arbitrary
- * page numbers via URL, so click-based pagination is the only option.
- *
- * Returns true when the next page loaded, false when the Next button is
- * disabled (end of results) or the click failed.
+ * Perform a single Next-page click attempt.
+ * Returns 'advanced' | 'disabled' | 'error'.
  */
-const gotoNextPage = async (page, { logger } = {}) => {
+const tryNextClick = async (page, { logger, clickDelay }) => {
 
     try {
 
@@ -43,10 +40,7 @@ const gotoNextPage = async (page, { logger } = {}) => {
             { timeout: 10_000 },
         );
 
-        if (!nextButton) {
-            if (logger) { logger.warn('Next Page button not found.'); }
-            return false;
-        }
+        if (!nextButton) { return 'error'; }
 
         const disabled = await page.evaluate(
             (el) => el.classList.contains('Mui-disabled') || el.getAttribute('aria-disabled') === 'true',
@@ -55,11 +49,9 @@ const gotoNextPage = async (page, { logger } = {}) => {
 
         if (disabled) {
             if (logger) { logger.info('Next Page button is disabled — reached the last page.'); }
-            return false;
+            return 'disabled';
         }
 
-        // Ensure the button is in view before clicking (long grids can push it
-        // below the fold and MUI ignores clicks on offscreen pagination controls).
         await page.evaluate((selector) => {
             const el = document.querySelector(selector);
             if (el) { el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'auto' }); }
@@ -67,42 +59,87 @@ const gotoNextPage = async (page, { logger } = {}) => {
 
         await nextButton.click();
 
-        // Give the SPA time to swap rows. A light jitter protects against
-        // HealthSherpa rate-limiting heuristics.
-        await sleep(400 + randomBetween(500, 1100));
+        await sleep(clickDelay.min + randomBetween(0, Math.max(0, clickDelay.max - clickDelay.min)));
 
-        try {
-
-            await page.waitForSelector(SELECTORS.RESULTS_CONTAINER, { timeout: TIMEOUTS.RESULTS_GRID });
-
-        } catch (err) {
-
-            if (logger) { logger.warn(`Results grid did not re-render after Next click: ${err.message}`); }
-            return false;
-        }
-
-        return true;
+        await page.waitForSelector(SELECTORS.RESULTS_CONTAINER, { timeout: TIMEOUTS.RESULTS_GRID });
+        return 'advanced';
 
     } catch (err) {
 
-        if (logger) { logger.warn(`gotoNextPage error: ${err.message}`); }
-        return false;
+        if (logger) { logger.warn(`Next-click attempt failed: ${err.message}`); }
+        return 'error';
     }
+};
+
+/**
+ * Click the "Next page" button with retry + in-place cleanup when the grid
+ * fails to re-render. HealthSherpa blocks deep-linking to arbitrary page
+ * numbers via URL, so click-based pagination is the only option.
+ *
+ * Returns:
+ *   - true when the next page loaded successfully
+ *   - false when the Next button is disabled (end of results) or all
+ *     retries failed
+ *
+ * Options:
+ *   - clickDelay: { min, max } sleep between click and grid re-render check
+ *   - attempts:   how many tries before giving up
+ */
+const gotoNextPage = async (page, { logger, clickDelay, attempts } = {}) => {
+
+    const delay = clickDelay || { min: 900, max: 1500 };
+    const maxAttempts = attempts || PAGE_RETRY.ATTEMPTS;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+
+        const outcome = await tryNextClick(page, { logger, clickDelay: delay });
+
+        if (outcome === 'advanced') { return true; }
+        if (outcome === 'disabled') { return false; }
+
+        // outcome === 'error' — the grid didn't re-appear. Most common
+        // cause on this codebase is the renderer being on the verge of an
+        // OOM (or having already crashed). Diagnose, run the most
+        // aggressive cleanup we have, then try again.
+        if (logger) {
+            logger.warn(`Next-click failed on attempt ${attempt}/${maxAttempts}, running recovery cleanup..`);
+        }
+
+        await logPageDiagnostics(page, { logger, label: `next-fail-${attempt}` });
+
+        if (attempt < maxAttempts) {
+
+            await cleanupInPlace(page, { logger, label: `next-retry-${attempt}` });
+            await sleep(PAGE_RETRY.BETWEEN_ATTEMPTS_MS);
+        }
+    }
+
+    if (logger) { logger.error(`gotoNextPage exhausted ${maxAttempts} attempts.`); }
+    return false;
 };
 
 /**
  * Click "Next" repeatedly to skip from page 1 to `targetPage`, running
  * `onInterval()` every `intervalPages` clicks. The callback is where memory
  * cleanup happens during the skip phase — important because a cold start
- * with STARTING_PAGE=160 means 159 consecutive clicks, which is exactly
+ * with STARTING_PAGE=160 means many consecutive clicks, which is exactly
  * what used to OOM the renderer.
  *
+ * Uses the skip-specific (slower) click delay by default, giving the SPA
+ * more breathing room between clicks.
+ *
  * Returns the actual page reached (may be less than targetPage if the
- * Next button became disabled before arriving).
+ * Next button became disabled or clicks stopped working before arriving).
  */
-const skipToStartingPage = async (page, targetPage, { logger, onInterval, intervalPages = 20 } = {}) => {
+const skipToStartingPage = async (page, targetPage, { logger, onInterval, intervalPages } = {}) => {
 
     if (targetPage <= 1) { return 1; }
+
+    const skipInterval = intervalPages || MEMORY_THRESHOLDS.SKIP_CLEANUP_EVERY_N_PAGES;
+    const clickDelay = {
+        min: MEMORY_THRESHOLDS.SKIP_CLICK_DELAY_MIN_MS,
+        max: MEMORY_THRESHOLDS.SKIP_CLICK_DELAY_MAX_MS,
+    };
 
     if (logger) { logger.info(`Skipping forward to page ${targetPage} via Next button..`); }
 
@@ -110,7 +147,7 @@ const skipToStartingPage = async (page, targetPage, { logger, onInterval, interv
 
     while (current < targetPage) {
 
-        const advanced = await gotoNextPage(page, { logger });
+        const advanced = await gotoNextPage(page, { logger, clickDelay });
         if (!advanced) {
 
             if (logger) { logger.warn(`Could not advance past page #${current} (Next disabled or error).`); }
@@ -123,9 +160,7 @@ const skipToStartingPage = async (page, targetPage, { logger, onInterval, interv
             logger.info(`Skip progress: page ${current} / ${targetPage}`);
         }
 
-        // Hand control back so the caller can do in-place memory cleanup
-        // without us having to know what that means.
-        if (onInterval && (current - 1) % intervalPages === 0) {
+        if (onInterval && (current - 1) % skipInterval === 0) {
             try { await onInterval(current); }
             catch (err) {
                 if (logger) { logger.warn(`skipToStartingPage onInterval error: ${err.message}`); }

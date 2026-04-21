@@ -1,7 +1,7 @@
 'use strict';
 
 const { detachInterception } = require('./browser');
-const { MEMORY_THRESHOLDS, CLEANUP } = require('../config/constants');
+const { MEMORY_THRESHOLDS, CLEANUP, STORAGE_TYPES_TO_CLEAR } = require('../config/constants');
 
 /**
  * Human-readable memory size formatting for log lines.
@@ -102,6 +102,24 @@ const cleanupInPlace = async (page, { logger, label = 'cleanup' } = {}) => {
         // on long runs (MUI bundles, icons, JSON responses, etc.).
         await client.send('Network.clearBrowserCache').catch(() => {});
 
+        // Wipe per-origin browser storage that we are certain does NOT hold
+        // auth state (no cookies, no localStorage, no indexeddb). This is
+        // what typically holds the biggest non-cache memory footprint:
+        // CacheStorage API, service worker scripts, shader cache, etc.
+        try {
+
+            const currentUrl = page.url();
+            if (currentUrl && /^https?:/i.test(currentUrl)) {
+
+                const origin = new URL(currentUrl).origin;
+                await client.send('Storage.clearDataForOrigin', {
+                    origin,
+                    storageTypes: STORAGE_TYPES_TO_CLEAR,
+                }).catch(() => {});
+            }
+
+        } catch (_) { /* origin parse failed, skip */ }
+
         // Prune DOM internals the SPA might be holding onto: any detached
         // DOM nodes kept alive only by React handlers. Safe best-effort.
         await page.evaluate(() => {
@@ -113,6 +131,12 @@ const cleanupInPlace = async (page, { logger, label = 'cleanup' } = {}) => {
             if (typeof window.gc === 'function') { try { window.gc(); } catch (_) { /* ignore */ } }
 
         }).catch(() => {});
+
+        // Re-run GC after clearing storage so the freed objects are actually
+        // reaped on this tick.
+        for (let i = 0; i < 2; i++) {
+            await client.send('HeapProfiler.collectGarbage').catch(() => {});
+        }
 
     } catch (err) {
 
@@ -207,10 +231,43 @@ const trimOrphanTabs = async (browser, mainPage, { logger } = {}) => {
     return closed;
 };
 
+/**
+ * Log what the page actually looks like right now. Useful when a click or
+ * selector wait times out and we want to know whether the renderer is
+ * alive at all.
+ */
+const logPageDiagnostics = async (page, { logger, label = 'diagnostic' } = {}) => {
+
+    if (!logger) { return; }
+
+    try {
+
+        const accessible = await isPageAccessible(page);
+        if (!accessible) {
+            logger.error(`[${label}] page is NOT accessible — renderer likely crashed (Aw, Snap!).`);
+            return;
+        }
+
+        const [title, url, sample] = await Promise.all([
+            page.title().catch(() => '(no title)'),
+            Promise.resolve(page.url()).catch(() => '(no url)'),
+            sampleMemory(page),
+        ]);
+
+        logger.warn(`[${label}] title="${title}" url="${url}"`);
+        logger.warn(`[${label}] RSS=${sample.formatted.rss} heap=${sample.formatted.jsHeap}`);
+
+    } catch (err) {
+
+        logger.warn(`[${label}] diagnostics failed: ${err.message}`);
+    }
+};
+
 module.exports = {
     cleanupInPlace,
     sampleMemory,
     trimOrphanTabs,
     isPageAccessible,
+    logPageDiagnostics,
     formatBytes,
 };
