@@ -103,18 +103,49 @@ const main = async () => {
     // With STARTING_PAGE=160 this is 159 consecutive Next clicks. We run
     // in-place memory cleanup every N pages during the skip so the grid's
     // accumulated state never reaches the OOM threshold.
+    //
+    // If the renderer heap crosses the critical threshold during the skip,
+    // a hard-reset would be useless here because it would re-skip and
+    // re-accumulate the same leak. Instead we abort with a clear error
+    // pointing the operator at MAX_OLD_SPACE_SIZE_MB.
     const arrivedAt = await skipToStartingPage(page, startingPage, {
         logger,
-        // intervalPages defaults to SKIP_CLEANUP_EVERY_N_PAGES — pass it
-        // explicitly to make the cadence obvious in this call site.
         intervalPages: MEMORY_THRESHOLDS.SKIP_CLEANUP_EVERY_N_PAGES,
         onInterval: async (pageJustReached) => {
+
             await cleanupInPlace(page, { logger, label: `skip-${pageJustReached}` });
             await trimOrphanTabs(browser, page, { logger });
+
+            const sample = await sampleMemory(page);
+            if (sample.jsHeap >= config.memory.jsHeapBytesCritical) {
+                return {
+                    abort: true,
+                    reason: `js-heap-critical (${sample.formatted.jsHeap})`,
+                };
+            }
+
+            return undefined;
         },
     });
 
-    if (arrivedAt !== startingPage) {
+    // If skip stopped short AND heap is at the critical line, we aborted
+    // because memory ran out. A hard-reset here would just repeat the same
+    // skip and land us back in the same spot — better to bail out loudly
+    // and have the operator raise MAX_OLD_SPACE_SIZE_MB.
+    const postSkipSample = await sampleMemory(page);
+    const skipShortByHeap = arrivedAt < startingPage
+        && postSkipSample.jsHeap >= config.memory.jsHeapBytesCritical;
+
+    if (skipShortByHeap) {
+
+        logger.error(`Skip phase aborted at page ${arrivedAt}/${startingPage} due to heap pressure.`);
+        logger.error(`Heap reached ${postSkipSample.formatted.jsHeap} — a reset+reskip would just repeat this.`);
+        logger.error(`Fix: raise MAX_OLD_SPACE_SIZE_MB in .env (try 12288 or 16384 if you have the RAM),`);
+        logger.error(`     or reduce STARTING_PAGE so the skip has less ground to cover.`);
+        throw new Error(`Skip phase aborted at page ${arrivedAt}/${startingPage} (heap critical).`);
+
+    } else if (arrivedAt !== startingPage) {
+
         logger.warn(`Could not reach STARTING_PAGE=${startingPage}; stopped at ${arrivedAt}.`);
     }
 
@@ -160,6 +191,7 @@ const main = async () => {
             sample: postPageSample,
             pagesSinceLastReset: state.pagesSinceLastReset,
             everyNPages: config.hardReset.everyNPages,
+            jsHeapBytesCritical: config.memory.jsHeapBytesCritical,
         });
 
         if (resetReason) {

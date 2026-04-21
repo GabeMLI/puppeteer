@@ -111,9 +111,9 @@ const hardResetMainPage = async (page, { config, logger, targetPage }) => {
  * Returns a string reason when a reset should happen, null otherwise.
  * The reason is surfaced in the log so the cause is auditable.
  */
-const shouldHardReset = ({ sample, pagesSinceLastReset, everyNPages }) => {
+const shouldHardReset = ({ sample, pagesSinceLastReset, everyNPages, jsHeapBytesCritical }) => {
 
-    if (sample && sample.jsHeap >= MEMORY_THRESHOLDS.JS_HEAP_BYTES_CRITICAL) {
+    if (sample && jsHeapBytesCritical && sample.jsHeap >= jsHeapBytesCritical) {
         return `js-heap-critical (${sample.formatted.jsHeap})`;
     }
 

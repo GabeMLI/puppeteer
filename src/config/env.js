@@ -2,7 +2,7 @@
 
 require('dotenv').config();
 
-const { STATE_FLAGS, DEFAULT_MAX_OLD_SPACE_MB, HARD_RESET } = require('./constants');
+const { STATE_FLAGS, DEFAULT_MAX_OLD_SPACE_MB, HARD_RESET, MEMORY_THRESHOLDS } = require('./constants');
 
 const isTruthy = (value) => {
     if (value === true) { return true; }
@@ -128,6 +128,13 @@ const loadConfig = () => {
         readInt('MAX_OLD_SPACE_SIZE_MB', DEFAULT_MAX_OLD_SPACE_MB) || DEFAULT_MAX_OLD_SPACE_MB,
     );
 
+    // Critical heap threshold is always a fraction of V8's ceiling so it
+    // scales correctly when the user tunes MAX_OLD_SPACE_SIZE_MB. At 8 GB
+    // ceiling this is 6 GB; at 16 GB ceiling it's 12 GB.
+    const jsHeapBytesCritical = Math.floor(
+        maxOldSpaceMb * 1024 * 1024 * MEMORY_THRESHOLDS.JS_HEAP_BYTES_CRITICAL_FRACTION,
+    );
+
     return Object.freeze({
         credentials: {
             username: requireString('USER_NAME'),
@@ -153,13 +160,16 @@ const loadConfig = () => {
         },
         hardReset: {
             // 0 disables preventive hard resets. Heap-triggered hard reset
-            // (on JS_HEAP_BYTES_CRITICAL) is NOT gated by this value — it
-            // always fires when the critical threshold is crossed.
+            // (on the computed critical threshold) is NOT gated by this
+            // value — it always fires when the critical threshold is crossed.
             everyNPages: Math.max(
                 0,
                 readInt('HARD_RESET_EVERY_N_PAGES', HARD_RESET.EVERY_N_PAGES)
                     ?? HARD_RESET.EVERY_N_PAGES,
             ),
+        },
+        memory: {
+            jsHeapBytesCritical,
         },
     });
 };

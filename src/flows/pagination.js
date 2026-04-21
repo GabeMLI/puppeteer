@@ -128,8 +128,15 @@ const gotoNextPage = async (page, { logger, clickDelay, attempts } = {}) => {
  * Uses the skip-specific (slower) click delay by default, giving the SPA
  * more breathing room between clicks.
  *
+ * `onInterval(currentPage)` may return:
+ *   - undefined / nothing    → continue skipping normally
+ *   - `{ abort: true, reason }` → stop the skip right here. The function
+ *     returns the page reached so the caller can decide what to do
+ *     (typically: hard-reset and restart the skip fresh from page 1).
+ *
  * Returns the actual page reached (may be less than targetPage if the
- * Next button became disabled or clicks stopped working before arriving).
+ * Next button became disabled, clicks stopped working, or onInterval
+ * requested an abort).
  */
 const skipToStartingPage = async (page, targetPage, { logger, onInterval, intervalPages } = {}) => {
 
@@ -161,9 +168,22 @@ const skipToStartingPage = async (page, targetPage, { logger, onInterval, interv
         }
 
         if (onInterval && (current - 1) % skipInterval === 0) {
-            try { await onInterval(current); }
+
+            let result;
+            try { result = await onInterval(current); }
             catch (err) {
                 if (logger) { logger.warn(`skipToStartingPage onInterval error: ${err.message}`); }
+            }
+
+            if (result && result.abort) {
+
+                if (logger) {
+                    logger.warn(
+                        `skipToStartingPage: aborting at page ${current} as requested ` +
+                        `by onInterval (${result.reason || 'no reason'}).`,
+                    );
+                }
+                return current;
             }
         }
     }

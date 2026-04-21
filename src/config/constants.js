@@ -130,13 +130,12 @@ const BLOCKED_URL_PATTERNS = Object.freeze([
 //   - JS_EVENT_LISTENERS:  React effect leaks show up as climbing listener counts.
 const MEMORY_THRESHOLDS = Object.freeze({
     JS_HEAP_BYTES: 250 * 1024 * 1024,          // 250 MB JS heap → in-place cleanup
-    // Hard reset is expensive (~5-8 min of re-skip per trigger) and only
-    // partially effective because the DataGrid row-retention leak re-builds
-    // during the re-skip.  We therefore only trigger it when the heap is
-    // close enough to V8's configured ceiling (default 8 GB) that continuing
-    // without it would likely OOM.  3.5 GB leaves ~4.5 GB of headroom —
-    // enough to absorb a few more pages and finish the run most of the time.
-    JS_HEAP_BYTES_CRITICAL: 3_500 * 1024 * 1024, // 3.5 GB JS heap → hard reset (emergency)
+    // NOTE: JS_HEAP_BYTES_CRITICAL is *computed* at runtime from the V8 heap
+    // ceiling (see env.js), because an absolute number doesn't make sense:
+    // it must always be a fraction of the actual ceiling to leave headroom
+    // for the heap spike that the hard reset itself causes mid-reset.
+    // Config exposes it as `config.memory.jsHeapBytesCritical`.
+    JS_HEAP_BYTES_CRITICAL_FRACTION: 0.75,     // 75% of V8 max-old-space-size
     DOM_NODES: 25_000,
     JS_EVENT_LISTENERS: 15_000,
     SAMPLE_EVERY_N_LINKS: 5,                   // how often to sample memory during link processing
@@ -144,7 +143,14 @@ const MEMORY_THRESHOLDS = Object.freeze({
     CLEANUP_EVERY_N_PAGES: 5,                  // scheduled cleanup cadence during processing phase
     // Skip phase is the most memory-hostile one (159 rapid clicks back-to-back
     // with no time to breathe). Everything here is intentionally more aggressive.
-    SKIP_CLEANUP_EVERY_N_PAGES: 5,
+    //
+    // Empirically, `cleanupInPlace` during skip reclaims ~60-90 MB per run
+    // but the DataGrid leak adds ~150 MB per 5 skipped pages, so cleanup at
+    // cadence 5 keeps up with only ~1/3 of the leak. Cadence 2 brings this
+    // up to ~5/6, which translates to a much flatter heap curve across the
+    // skip (e.g. ending the skip near ~2.5 GB instead of ~3.6 GB for 160
+    // skipped pages). Cost: ~1.5-2 extra min for a 160-page skip.
+    SKIP_CLEANUP_EVERY_N_PAGES: 2,
     SKIP_CLICK_DELAY_MIN_MS: 2_000,
     SKIP_CLICK_DELAY_MAX_MS: 3_500,
 });
