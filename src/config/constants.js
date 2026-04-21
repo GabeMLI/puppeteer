@@ -107,6 +107,16 @@ const BLOCKED_URL_PATTERNS = Object.freeze([
     'pinterest.com',
     'linkedin.com/px',
     'licdn.com/px',
+    // HealthSherpa customer-support chat widget (WebSocket + iframe).
+    // The bot never interacts with it, and its persistent connection adds
+    // work to every tab we open.
+    'niceincontact.com',
+    'nicecxone.com',
+    'incontact.com',
+    // Additional common noise the bot doesn't need.
+    'launchdarkly.com',
+    'cloudflareinsights.com',
+    'googlesyndication.com',
 ]);
 
 // Memory watchdog thresholds — when exceeded, run cleanupInPlace.
@@ -119,7 +129,8 @@ const BLOCKED_URL_PATTERNS = Object.freeze([
 //                          manifest here. 25k+ means rows aren't being recycled.
 //   - JS_EVENT_LISTENERS:  React effect leaks show up as climbing listener counts.
 const MEMORY_THRESHOLDS = Object.freeze({
-    JS_HEAP_BYTES: 250 * 1024 * 1024,          // 250 MB JS heap on main tab
+    JS_HEAP_BYTES: 250 * 1024 * 1024,          // 250 MB JS heap → in-place cleanup
+    JS_HEAP_BYTES_CRITICAL: 900 * 1024 * 1024, // 900 MB JS heap → hard reset (see HARD_RESET below)
     DOM_NODES: 25_000,
     JS_EVENT_LISTENERS: 15_000,
     SAMPLE_EVERY_N_LINKS: 5,                   // how often to sample memory during link processing
@@ -130,6 +141,18 @@ const MEMORY_THRESHOLDS = Object.freeze({
     SKIP_CLEANUP_EVERY_N_PAGES: 5,
     SKIP_CLICK_DELAY_MIN_MS: 2_000,
     SKIP_CLICK_DELAY_MAX_MS: 3_500,
+});
+
+// Hard-reset = reload the main page to drop the accumulated renderer heap,
+// then click-skip back to the page we were on.  Cookies survive the reload,
+// so the Google auth session does NOT need to be re-entered.
+//
+// This is the only effective way to recover from a leaked-references heap
+// (e.g. MUI DataGrid retaining rows from prior pages) where `cleanupInPlace`
+// can only free a tiny fraction because the objects are still "live".
+const HARD_RESET = Object.freeze({
+    EVERY_N_PAGES: 75,                         // preventive reload cadence (0 = disabled)
+    POST_RELOAD_WAIT_MS: 3_000,                // breather after reload before re-skip starts
 });
 
 // Retry behaviour when the "Next page" click fails to re-render the grid.
@@ -192,4 +215,5 @@ module.exports = {
     LOG_FILE_NAME,
     DEFAULT_MAX_OLD_SPACE_MB,
     DEFAULT_BROWSER_FLAGS,
+    HARD_RESET,
 };

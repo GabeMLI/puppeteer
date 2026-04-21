@@ -32,6 +32,7 @@ const { login } = require('./src/flows/login');
 const { visitFilters } = require('./src/flows/filters');
 const { gotoNextPage, skipToStartingPage, isOnLastPage } = require('./src/flows/pagination');
 const { processCurrentPage } = require('./src/flows/processPage');
+const { hardResetMainPage, shouldHardReset } = require('./src/flows/hardReset');
 
 const runMemoryCheck = async ({ mainPage, logger, label }) => {
 
@@ -66,6 +67,8 @@ const main = async () => {
         linkNumber: 0,
         lastProcessedPage: null,
         pagesRan: 0,
+        pagesSinceLastReset: 0,
+        hardResetsDone: 0,
     };
 
     const shutdownCtx = { logger, browser: null, state };
@@ -135,6 +138,7 @@ const main = async () => {
         });
 
         state.pagesRan++;
+        state.pagesSinceLastReset++;
 
         // Scheduled in-place cleanup even when thresholds aren't hit, to
         // keep the renderer's heap from drifting upward over long runs.
@@ -145,6 +149,36 @@ const main = async () => {
             // Light-touch check after every page — logs the memory trend
             // and triggers cleanup only if thresholds are breached.
             await runMemoryCheck({ mainPage: page, logger, label: `p${currentPage}` });
+        }
+
+        // Hard-reset check: when the heap has grown past the critical
+        // threshold (leaked references that cleanup can't touch), OR when
+        // the scheduled cadence fires, reload the main tab and re-skip.
+        // This is the only effective remedy against MUI DataGrid leaks.
+        const postPageSample = await sampleMemory(page);
+        const resetReason = shouldHardReset({
+            sample: postPageSample,
+            pagesSinceLastReset: state.pagesSinceLastReset,
+            everyNPages: config.hardReset.everyNPages,
+        });
+
+        if (resetReason) {
+
+            logger.warn(`[hard-reset] triggered: ${resetReason}`);
+
+            await trimOrphanTabs(browser, page, { logger });
+
+            currentPage = await hardResetMainPage(page, {
+                config,
+                logger,
+                targetPage: currentPage,
+            });
+
+            state.pagesSinceLastReset = 0;
+            state.hardResetsDone++;
+            // After a successful reset we're still on `currentPage` and ready
+            // to process its links — no need to advance here.
+            continue;
         }
 
         if (linkCount === 0 && (await isOnLastPage(page))) {
@@ -163,6 +197,10 @@ const main = async () => {
     }
 
     logger.info('Bot reached the end, stopping..');
+    logger.info(
+        `Summary: pagesRan=${state.pagesRan}, hardResets=${state.hardResetsDone}, ` +
+        `lastPage=${state.lastProcessedPage}`,
+    );
 
     try { await browser.close(); } catch (_) { /* ignore */ }
     await logger.close();

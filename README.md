@@ -80,6 +80,13 @@ never lost — are:
 - **Scheduled cleanup** — once per `CLEANUP_EVERY_N_PAGES` pages the
   bot runs `cleanupInPlace` unconditionally, so the renderer's heap
   doesn't drift upward over long runs.
+- **Periodic hard reset** — every `HARD_RESET_EVERY_N_PAGES` (default 75),
+  or whenever the renderer heap crosses the critical threshold (900 MB),
+  the bot navigates the main tab through `about:blank` + re-visits the
+  filtered list URL, then re-skips to the current page.  This is the only
+  effective remedy against MUI DataGrid's "live references" leak (retained
+  rows from every previously-visited page).  Cookies survive the reload,
+  so the Google auth session is not lost.
 - **Raised V8 heap ceiling** — `--js-flags=--max-old-space-size=N` raises
   Chromium's per-renderer heap limit from the default 2-4 GB to 8 GB
   (configurable via `MAX_OLD_SPACE_SIZE_MB`). Switching to Edge/Chrome
@@ -121,6 +128,7 @@ can be tuned without touching the flow code.
 | `BROWSER_EXECUTABLE_PATH`  | Full override path to the browser binary                                                         |
 | `MAX_OLD_SPACE_SIZE_MB`    | V8 heap ceiling per renderer (default `8192`). Raise on machines with 32 GB+ RAM, lower on 8 GB  |
 | `EXTRA_BROWSER_FLAGS`      | Comma-separated extra Chromium launch flags                                                      |
+| `HARD_RESET_EVERY_N_PAGES` | Reload main tab + re-skip every N pages (default `75`, `0` = disabled)                           |
 | `FILTER_*`, `STATE_*`      | Result filters — see `.env.example` for the full catalogue                                       |
 
 `.env.example` documents every option and is kept in sync with the code.

@@ -2,7 +2,7 @@
 
 require('dotenv').config();
 
-const { STATE_FLAGS, DEFAULT_MAX_OLD_SPACE_MB } = require('./constants');
+const { STATE_FLAGS, DEFAULT_MAX_OLD_SPACE_MB, HARD_RESET } = require('./constants');
 
 const isTruthy = (value) => {
     if (value === true) { return true; }
@@ -150,6 +150,16 @@ const loadConfig = () => {
         browser: {
             maxOldSpaceMb,
             extraFlags: parseFlagList(readString('EXTRA_BROWSER_FLAGS', '')),
+        },
+        hardReset: {
+            // 0 disables preventive hard resets. Heap-triggered hard reset
+            // (on JS_HEAP_BYTES_CRITICAL) is NOT gated by this value — it
+            // always fires when the critical threshold is crossed.
+            everyNPages: Math.max(
+                0,
+                readInt('HARD_RESET_EVERY_N_PAGES', HARD_RESET.EVERY_N_PAGES)
+                    ?? HARD_RESET.EVERY_N_PAGES,
+            ),
         },
     });
 };
