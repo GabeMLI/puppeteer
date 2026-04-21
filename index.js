@@ -1,897 +1,129 @@
-// const puppeteer = require( 'puppeteer' );
-const fs = require('node:fs/promises');
-const fsSync = require('node:fs');
-
-const { connect } = require("puppeteer-real-browser");
-
-// const chromePaths = require( 'chrome-paths' );
-// const {executablePath} = require( 'puppeteer' );
-
-// https://stackoverflow.com/questions/55678095/bypassing-captchas-with-headless-chrome-using-puppeteer
-// const StealthPlugin = require( 'puppeteer-extra-plugin-stealth' );
-// puppeteer.use( StealthPlugin() );
-
-// const AdblockerPlugin = require( 'puppeteer-extra-plugin-adblocker' );
-// puppeteer.use( AdblockerPlugin({ blockTrackers: true }));
-
-// https://github.com/intoli/user-agents
-// var userAgent = require( 'user-agents' ); // NOT USED
+'use strict';
 
 /**
- * USEFUL DOCS:
- *  https://github.com/puppeteer/puppeteer/pull/11782 <-- deprecated $x and waitForXPath
- *  https://scrapeops.io/puppeteer-web-scraping-playbook/nodejs-puppeteer-real-browser/#waiting-for-page-load <-- real-browser guide
- */
-
-require('dotenv').config();
-
-const log_file_name = 'recorded-log.txt';
-
-// Known install locations for Brave and Chrome across platforms.
-// Arrays are checked in order; the first path that exists on disk wins.
-const DEFAULT_BROWSER_PATHS = {
-    brave: {
-        darwin: [
-            '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser',
-        ],
-        linux: [
-            '/usr/bin/brave-browser',
-            '/usr/bin/brave',
-            '/snap/bin/brave',
-            '/opt/brave.com/brave/brave-browser',
-        ],
-        win32: [
-            'C:\\Program Files\\BraveSoftware\\Brave-Browser\\Application\\brave.exe',
-            'C:\\Program Files (x86)\\BraveSoftware\\Brave-Browser\\Application\\brave.exe',
-            `${process.env.LOCALAPPDATA || ''}\\BraveSoftware\\Brave-Browser\\Application\\brave.exe`,
-        ],
-    },
-    chrome: {
-        darwin: [
-            '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-            '/Applications/Google Chrome Beta.app/Contents/MacOS/Google Chrome Beta',
-            '/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary',
-            '/Applications/Chromium.app/Contents/MacOS/Chromium',
-        ],
-        linux: [
-            '/usr/bin/google-chrome',
-            '/usr/bin/google-chrome-stable',
-            '/usr/bin/chromium-browser',
-            '/usr/bin/chromium',
-            '/snap/bin/chromium',
-        ],
-        win32: [
-            'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
-            'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
-            `${process.env.LOCALAPPDATA || ''}\\Google\\Chrome\\Application\\chrome.exe`,
-        ],
-    },
-};
-
-const findFirstExistingPath = (paths = []) => {
-
-    for (const candidate of paths) {
-
-        if (!candidate) { continue; }
-
-        try {
-
-            if (fsSync.existsSync(candidate)) { return candidate; }
-
-        } catch (_) { /* ignore */ }
-    }
-
-    return null;
-}
-
-const detectBrowser = (name) => {
-
-    const byPlatform = DEFAULT_BROWSER_PATHS[name];
-    if (!byPlatform) { return null; }
-
-    return findFirstExistingPath(byPlatform[process.platform] || []);
-}
-
-/**
- * Resolve which browser executable to launch.
- * Returns { path, name } or null if nothing was found.
+ * HealthSherpa automation bot.
  *
- * Priority:
- *   1. BROWSER_EXECUTABLE_PATH / BRAVE_PATH / CHROME_PATH (explicit override)
- *   2. BROWSER env var ("brave" or "chrome") picks that one first, falls back to the other
- *   3. USE_BRAVE=true prefers Brave, falls back to Chrome
- *   4. Default: try Brave first, then Chrome
+ * High-level flow:
+ *   1. Launch Brave/Chrome via puppeteer-real-browser (see src/core/browser.js)
+ *   2. Log in (operator completes the Google auth code manually — see README)
+ *   3. Visit the filtered list page once to warm up the session
+ *   4. For each page N starting at STARTING_PAGE, navigate DIRECTLY to
+ *      that page via URL (no "Next" button clicks) and process its links
+ *   5. Periodically trim orphan tabs, sample memory, and soft-reset the
+ *      main page when thresholds are exceeded — never closing the browser,
+ *      so the Google auth session is preserved.
+ *
+ * See docs/architecture.md and src/config/constants.js for tunables.
  */
-const getBrowserExecutable = () => {
 
-    const forcedPath = process.env.BROWSER_EXECUTABLE_PATH
-        || process.env.BRAVE_PATH
-        || process.env.CHROME_PATH;
+const { loadConfig } = require('./src/config/env');
+const { Logger } = require('./src/core/logger');
+const { launchBrowser } = require('./src/core/browser');
+const { installShutdownHandlers } = require('./src/core/shutdown');
+const { softResetMainPage, sampleMemory } = require('./src/core/memory');
+const { MEMORY_THRESHOLDS } = require('./src/config/constants');
 
-    if (forcedPath) {
-        return { path: forcedPath, name: 'custom' };
-    }
+const { login } = require('./src/flows/login');
+const { visitFilters } = require('./src/flows/filters');
+const { gotoPage, urlForPage, isOnLastPage } = require('./src/flows/pagination');
+const { processCurrentPage } = require('./src/flows/processPage');
 
-    const preference = (process.env.BROWSER || '').toLowerCase();
-    let order;
-    if (preference === 'chrome') {
-        order = ['chrome', 'brave'];
-    } else if (preference === 'brave' || isTruthy(process.env.USE_BRAVE)) {
-        order = ['brave', 'chrome'];
-    } else {
-        order = ['brave', 'chrome'];
-    }
+const main = async () => {
 
-    for (const name of order) {
+    const config = loadConfig();
+    const logger = new Logger({ truncate: true });
 
-        const path = detectBrowser(name);
-        if (path) { return { path, name }; }
-    }
+    // Shared mutable state observed by the shutdown handler for resume hints.
+    const state = {
+        linkNumber: 0,
+        lastProcessedPage: null,
+        pagesRan: 0,
+    };
 
-    return null;
-}
+    const shutdownCtx = { logger, browser: null, state };
+    installShutdownHandlers(shutdownCtx);
 
-// ----------------------------------------------------------------------
+    logger.info('HealthSherpa bot starting..');
+    logger.info(`Agent: ${config.agent.name} (${config.agent.tag})`);
+    logger.info(`Bot mode: ${config.botMode}`);
+    logger.info(`Starting page: ${config.pagination.startingPage}`);
+    logger.info(
+        config.pagination.maxPagesToRun
+            ? `Max pages to run: ${config.pagination.maxPagesToRun}`
+            : 'No page limit specified..',
+    );
 
-const STATE_FLAGS = {
-    FILTER_FOR_ALABAMA: 'AL',
-    FILTER_FOR_ALASKA: 'AK',
-    FILTER_FOR_ARIZONA: 'AZ',
-    FILTER_FOR_ARKANSAS: 'AR',
-    FILTER_FOR_DELAWARE: 'DE',
-    FILTER_FOR_FLORIDA: 'FL',
-    FILTER_FOR_GEORGIA: 'GA',
-    FILTER_FOR_ILLINOIS: 'IL',
-    FILTER_FOR_INDIANA: 'IN',
-    FILTER_FOR_IOWA: 'IA',
-    FILTER_FOR_KANSAS: 'KS',
-    FILTER_FOR_LOUISIANA: 'LA',
-    FILTER_FOR_MICHIGAN: 'MI',
-    FILTER_FOR_MISSISSIPPI: 'MS',
-    FILTER_FOR_MISSOURI: 'MO',
-    FILTER_FOR_MONTANA: 'MT',
-    FILTER_FOR_NEBRASKA: 'NE',
-    FILTER_FOR_NEW_HAMPSHIRE: 'NH',
-    FILTER_FOR_NORTH_CAROLINA: 'NC',
-    FILTER_FOR_NORTH_DAKOTA: 'ND',
-    FILTER_FOR_OHIO: 'OH',
-    FILTER_FOR_OKLAHOMA: 'OK',
-    FILTER_FOR_OREGON: 'OR',
-    FILTER_FOR_SOUTH_CAROLINA: 'SC',
-    FILTER_FOR_TENNESSEE: 'TN',
-    FILTER_FOR_TEXAS: 'TX',
-    FILTER_FOR_UTAH: 'UT',
-    FILTER_FOR_WEST_VIRGINIA: 'WV',
-    FILTER_FOR_WISCONSIN: 'WI',
-    FILTER_FOR_WYOMING: 'WY',
-};
+    const { browser, page } = await launchBrowser({ logger });
+    shutdownCtx.browser = browser;
 
-const RESULTS_CONTAINER_SELECTOR = '[role="grid"], .MuiDataGrid-main';
+    await login(page, {
+        username: config.credentials.username,
+        password: config.credentials.password,
+        logger,
+    });
 
-const isTruthy = (value = '') => {
+    // After login the operator may need to manually input the Google auth
+    // code. We don't race the results grid here — we just proceed to
+    // the filtered URL, which will redirect to auth if required.
+    await visitFilters(page, config, { logger });
 
-    return [true, 'true'].includes(value);
-}
+    const { startingPage, maxPagesToRun } = config.pagination;
+    let currentPage = startingPage;
 
-// ----------------------------------------------------------------------
-// Small helpers to slow actions and add human-like timing
-const sleep = (ms = 300) => new Promise(resolve => setTimeout(resolve, ms));
-const randomBetween = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
-const humanPause = async (min = 120, max = 380) => sleep(randomBetween(min, max));
+    while (true) {
 
-async function log(msg = '', flag = 'a+') {
+        if (maxPagesToRun && state.pagesRan >= maxPagesToRun) {
+            logger.info(`Reached NUMBER_PAGES_TO_RUN=${maxPagesToRun}, stopping.`);
+            break;
+        }
 
-    try {
+        const gridLoaded = await gotoPage(page, currentPage, config, { logger });
+        if (!gridLoaded) {
+            logger.warn(`Could not load results grid on page #${currentPage}, stopping.`);
+            break;
+        }
 
-        console.log(msg);
-        await fs.writeFile(log_file_name, `${msg}\n`, { flag: flag });
-
-    } catch (err) {
-
-        console.log('Error Writing Log..', err);
-
-    } finally {
-
-        return;
-    }
-}
-
-const timestamp = () => {
-
-    const timestamp = new Date().toString();
-    // .replace( /T/, ' ' )   // replace T with a space
-    // .replace( /\..+/, '' ) // delete the dot and everything after
-
-    log(timestamp);
-}
-
-const login = async (page) => {
-
-    await page.goto('https://www.healthsherpa.com/sessions/new', { waitUntil: 'domcontentloaded' });
-
-    await page.waitForSelector('#username_or_email');
-    await log('found username form field..');
-    await page.type('#username_or_email', process.env.USER_NAME, { delay: randomBetween(60, 120) });
-    await humanPause(150, 350);
-
-    await page.waitForSelector('#password');
-    await log('found password form field..');
-    await page.type('#password', process.env.PASSWORD, { delay: randomBetween(60, 120) });
-    await humanPause(200, 450);
-
-    await page.waitForSelector('#login-submit-button');
-    await log('logging in..');
-
-    await sleep(400 + randomBetween(100, 600));
-
-    await page.click('#login-submit-button');
-
-    // Wait for navigation/network to settle a bit after clicking
-    try {
-        await Promise.race([
-            page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 }),
-            (async () => { await sleep(2000 + randomBetween(250, 800)); })(),
-        ]);
-    } catch (_) { /* ignore */ }
-
-    return;
-}
-
-const setFilters = async (page) => {
-
-    // await log( process.env );
-
-    const bot_mode = process.env.BOT_MODE;
-
-    const base_url = process.env.BASE_URL + process.env.AGENT_TAG + bot_mode + '?_agent_id=' + process.env.AGENT_TAG;
-    let extra_filters = [];
-
-    if (bot_mode == "/enrollment_leads") {
-        // -- Filters for Auto Enroll Lead List --------------------------------------------------------------------------------------
-
-        extra_filters.push('enrollment_leads[archived]=not_archived');
-        extra_filters.push('enrollment_leads[offEx]=false');
-        extra_filters.push('enrollment_leads[exchange][]=onEx');
-        extra_filters.push('enrollment_leads[sharedBook]=false');
-        extra_filters.push('enrollment_leads[fullBook]=true');
-        extra_filters.push('enrollment_leads[search]=true');
-        extra_filters.push('term=');
-        extra_filters.push('desc[]=lead_updated_at');
-        extra_filters.push('enrollment_leads[display_status][]=applying');
-        extra_filters.push('enrollment_leads[display_status][]=confirming');
-
-        // https://www.healthsherpa.com/agents/tani-blum-_wxdza/enrollment_leads?_agent_id=tani-blum-_wxdza&renewal=all&exchange=onEx&include_shared_applications=true&per_page=50&page=1&enrollment_leads[archived]=not_archived&enrollment_leads[offEx]=false&enrollment_leads[exchange][]=onEx&enrollment_leads[sharedBook]=false&enrollment_leads[fullBook]=true&enrollment_leads[search]=true&term=&desc[]=lead_updated_at&agent_id=tani-blum-_wxdza
-    } else {
-        // -- Filters for Regular Client List ----------------------------------------------------------------------------------------
-        // Example URL for reference (commented to avoid syntax errors):
-        // https://www.healthsherpa.com/agents/angel-arce-rvyoyq/clients?_agent_id=angel-arce-rvyoyq&ffm_applications[agent_archived]=not_archived&ffm_applications[search]=true&term=&renewal=all&desc[]=created_at&agent_id=angel-arce-rvyoyq&page=1&per_page=50&exchange=onEx&include_shared_applications=false&include_all_applications=false&states[]=AL
-
-        // extra_filters.push( 'per_page=' + process.env.PAGE_COUNT );
-
-        if (isTruthy(process.env.FILTER_FOR_UNPAID_BINDER)) { extra_filters.push(process.env.UNPAID_BINDER_FILTER); }
-        if (isTruthy(process.env.FILTER_FOR_PAID_BINDER)) { extra_filters.push(process.env.PAID_BINDER_FILTER); }
-        if (isTruthy(process.env.FILTER_FOR_PAID)) { extra_filters.push(process.env.PAID_FILTER); }
-        if (isTruthy(process.env.FILTER_FOR_PAST_DUE)) { extra_filters.push(process.env.PAST_DUE_FILTER); }
-        if (isTruthy(process.env.FILTER_FOR_UNKNOWN)) { extra_filters.push(process.env.UNKNOWN_FILTER); }
-        if (isTruthy(process.env.FILTER_FOR_CANCELLED)) { extra_filters.push(process.env.CANCEL_FILTER); }
-        if (isTruthy(process.env.FILTER_FOR_TERMINATED)) { extra_filters.push(process.env.TERMED_FILTER); }
-
-        if (isTruthy(process.env.INCLUDE_ARCHIVED)) { extra_filters.push(process.env.ARCHIVE_FILTER_BASE + process.env.INCLUDE_ARCHIVE_FILTER); }
-        else { extra_filters.push(process.env.ARCHIVE_FILTER_BASE + process.env.EXCLUDE_ARCHIVE_FILTER); }
-
-        if (!!process.env.FILTER_NAME) { extra_filters.push(process.env.NAME_FILTER_BASE + process.env.FILTER_NAME); }
-
-        if (isTruthy(process.env.FILTER_AGENCY)) { extra_filters.push(process.env.SCOPE_FILTER_BASE + 'true'); }
-        else { extra_filters.push(process.env.SCOPE_FILTER_BASE + 'false'); }
-
-        if (isTruthy(process.env.FILTER_DESCENDING)) { extra_filters.push('desc[]=ffm_effective_date'); }
-        else { extra_filters.push('asc[]=ffm_effective_date'); }
-
-        if (isTruthy(process.env.FILTER_2022)) { extra_filters.push(process.env.PLAN_YEAR_FILTER + '2022'); }
-        if (isTruthy(process.env.FILTER_2023)) { extra_filters.push(process.env.PLAN_YEAR_FILTER + '2023'); }
-        if (isTruthy(process.env.FILTER_2024)) { extra_filters.push(process.env.PLAN_YEAR_FILTER + '2024'); }
-        if (isTruthy(process.env.FILTER_2025)) { extra_filters.push(process.env.PLAN_YEAR_FILTER + '2025'); }
-        if (isTruthy(process.env.FILTER_2026)) { extra_filters.push(process.env.PLAN_YEAR_FILTER + '2026'); }
-
-        Object.entries(STATE_FLAGS).forEach(([state_name, state_abbr]) => {
-            if (isTruthy(process.env[state_name])) { extra_filters.push(`states[]=${state_abbr}`); }
+        const { linkCount } = await processCurrentPage({
+            browser,
+            mainPage: page,
+            config,
+            logger,
+            state,
+            pageNumber: currentPage,
         });
-    }
-    // ------------------------------------------------------------------------------------------------------------------------------------
 
-    const filter_string = extra_filters.join('&');
-
-    const full_url = `${base_url}${process.env.COMMON_FILTERS}&${filter_string}`;
-    await log(full_url);
-
-    await page.goto(full_url, { waitUntil: 'domcontentloaded' });
-
-    return process.env.AGENT_NAME;
-}
-
-const findFfmError = async (puppet_object) => {
-
-    try {
-
-        await puppet_object.waitForSelector('.fade.modal-backdrop', { timeout: 3000 });
-
-        await log('FFM Renew Alert Detected..');
-
-        // const closeButton = await puppet_object.$x( "//div[@style='position: absolute; top: 0px; right: 0px;']//button[contains(@aria-label,'Close') and text()-'X']" );
-        const closeButton = await puppet_object.$$("xpath/.//div[@style='position: absolute; top: 0px; right: 0px;']//button[contains(@aria-label,'Close') and (text()='X' or contains(text(),'X'))]");
-        await closeButton[0].click();
-
-    } catch (e) {
-
-        // fail silently..
-    } finally {
-
-        return;
-    }
-}
-
-const sherpaRefresh = async () => {
-
-    await log('', 'w+'); // clears file
-
-    const detected = getBrowserExecutable();
-    const launcherConfig = detected ? { chromePath: detected.path } : {};
-    if (detected) {
-        const label = detected.name === 'custom'
-            ? 'custom'
-            : detected.name.charAt(0).toUpperCase() + detected.name.slice(1);
-        await log(`Detected ${label} browser at: ${detected.path}`);
-    } else {
-        await log('No Brave or Chrome installation detected, falling back to puppeteer-real-browser default.');
-    }
-
-    const { browser } = await connect({
-
-        headless: false,
-        // chromePath: '/path/to/browser' is passed via customConfig (chrome-launcher)
-        args: [],
-        customConfig: launcherConfig,
-        turnstile: true,
-        connectOption: {
-            defaultViewport: null,
-        },
-        disableXvfb: false,
-        ignoreAllFlags: false,
-        // proxy:{
-        //     host:'<proxy-host>',
-        //     port:'<proxy-port>',
-        //     username:'<proxy-username>',
-        //     password:'<proxy-password>'
-        // }
-    });
-
-    // await page.goto("<url>");
-
-    // const browser = await puppeteer.launch({
-    //     headless: false,
-    //     executablePath: chromePaths.chrome,
-    //     // ignoreHTTPSErrors: true,
-    //     // executablePath: executablePath(),
-    //     defaultViewport: false
-    // });
-    const page = await browser.newPage();
-    page.setDefaultTimeout(30000);
-    page.setDefaultNavigationTimeout(30000);
-
-    // console.log( chromePaths );
-    // await page.waitForTimeout( 90000000000 );
-
-    // -- THINGS TO AVOID DETECTION --------------------
-
-    // page.setUserAgent( userAgent.random().toString() ) // LEMON
-
-    // Add Headers 
-    // await page.setExtraHTTPHeaders({
-
-    //     'user-agent': 'Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36',
-    //     'upgrade-insecure-requests': '1',
-    //     'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-    //     'accept-encoding': 'gzip, deflate, br',
-    //     'accept-language': 'en-US,en;q=0.9,en;q=0.8'
-    // });
-
-    // -- Only load text to make this go faster --------
-
-    await page.setRequestInterception(true);
-    page.on('request', async (request) => {
-
-        if (request.resourceType() == 'image') {
-
-            await request.abort();
-
-        } else {
-
-            await request.continue();
-        }
-    });
-
-    // -- Close First Page --------------------------------------------------
-
-    // Get all open pages
-    let allPages = await browser.pages();
-
-    let selected_tab = null;
-    const page_count = allPages.length;
-    let iteration = 0;
-    while (!selected_tab) {
-
-        if (allPages[iteration] != page) {
-
-            selected_tab = allPages[iteration];
-
-        } else {
-
-            iteration++;
-        }
-    }
-    await log(`Targeting First Blank Page: ${iteration}..`);
-    await selected_tab.bringToFront();
-
-    const on_main_page = (selected_tab == page);
-    await log(on_main_page ? 'Main Page detected, not closing..' : 'Closing Tab..');
-
-    if (!on_main_page) {
-
-        await selected_tab.close();
-    }
-
-    // -- Login -------------------------------------------------------------
-
-    await login(page);
-
-    await sleep(300 + randomBetween(400, 900));
-    // await page.waitForTimeout( 3000 );
-
-    await findFfmError(page); // optionally close the "integrate your ffm" modal
-
-    // -- Part 1, setup the page with filters --------------------------------------------------
-
-    const agent = await setFilters(page);
-
-    // --------------------------------------------------------------------------------------------
-    // -- Part 2, select each link ----------------------------------------------------------------
-
-    // Wait for the table to be present on the page
-    await log('searching for results grid..');
-    // await page.waitForTimeout( 90000000000 );
-    await page.waitForSelector(RESULTS_CONTAINER_SELECTOR);
-
-    const starting_page = process.env.STARTING_PAGE || 1;
-    let current_page = 1; // DONT CHANGE THIS
-    let pages_ran = 0; // DONT CHANGE THIS
-    let current_link = 0; // DONT CHANGE THIS
-    const number_pages_to_run = process.env.NUMBER_PAGES_TO_RUN || null; // DONT CHANGE THIS
-
-    await log(number_pages_to_run ? `${number_pages_to_run} pages specified to run..` : 'No page limit specified..');
-
-    while (number_pages_to_run ? pages_ran < number_pages_to_run : true) {
-
-        // await page.waitForTimeout( 1000 );
-        await new Promise(r => setTimeout(r, 1000));
-
-        if (current_page >= starting_page) {
-
-            await log('------------------------------');
-            timestamp();
-            await log(`Processing Page #${current_page}..`);
-            await log('');
-
-            await new Promise(r => setTimeout(r, 2500));
-            // await page.waitForTimeout( 2500 );
-
-            // Get all links from the current page
-            const links = await page.$$(`${RESULTS_CONTAINER_SELECTOR} a[href*="/agents/${agent}"]`);
-
-            // Use Set to store unique href values
-            const uniqueLinksSet = new Set();
-
-            // Extract unique href values
-            for (const linkElement of links) {
-
-                const href = await page.evaluate(link => link.href, linkElement);
-                uniqueLinksSet.add(href);
-            }
-
-            // Convert Set to an array of unique href values
-            const uniqueLinks = Array.from(uniqueLinksSet);
-
-            await log('');
-            await log(`Found ${uniqueLinks.length} links on this page..`);
-            await log('');
-
-            // Open each link in a new tab
-            for (const link of uniqueLinks) {
-
-                try {
-
-                    await trimOpenPages(browser, page);
-
-                } catch (e) {
-
-                    await log(`-- Trimming Tab Error --`);
-                    await log(`ERROR MSG - ${e.message}`);
-                    await log('');
-                }
-
-                await new Promise(r => setTimeout(r, 500));
-                // await page.waitForTimeout( 500 );
-
-                // const linkHref = await page.evaluate( link => link.href, link );
-                await log('------------------------------');
-                timestamp();
-                await log(`Processing Link #${current_link}: ${link}..`);
-
-                try {
-
-                    // ******************************************************************************************
-                    await processTab(await browser.newPage(), link, current_page, current_link);
-                    // ******************************************************************************************
-
-                } catch (e) {
-
-                    await log(`-- Processing Tab Error --`);
-                    await log(`ERROR MSG - ${e.message}`);
-                    await log('');
-                    // await newTab.close();
-                }
-
-                // if( current_link > 0 ){ await closePreviousTab( browser, page, current_page, current_link ); }
-
-                current_link++;
-            }
-
-            pages_ran++;
-
-        } else {
-
-            await log(`Skipping Page #${current_page}..`);
+        state.pagesRan++;
+
+        // Preventive soft reset on a fixed cadence — even if thresholds
+        // haven't been hit, long-lived SPA state accumulates slowly.
+        if (state.pagesRan % MEMORY_THRESHOLDS.SOFT_RESET_EVERY_N_PAGES === 0) {
+            const sample = await sampleMemory(page);
+            logger.info(`[memory] scheduled check after ${state.pagesRan} pages: RSS=${sample.formatted.rss} heap=${sample.formatted.jsHeap}`);
+            await softResetMainPage(page, urlForPage(config, currentPage), { logger });
         }
 
-        current_page++;
+        if (linkCount === 0) {
 
-        // -- Pagination ------------------------------------------------------------------------------
-
-        try {
-            // attempt to paginate..
-
-            const nextButton = await page.waitForSelector('[aria-label="Go to next page"]', { timeout: 10000 })
-
-            const isDisabled = await page.evaluate(nextButton => nextButton.classList.contains('Mui-disabled'), nextButton);
-            if (isDisabled) {
-                // if the button also is disabled, we are at the end and can break..
-
-                await log(`Next Button Disabled on Page #${current_page}, most likely the last page..`);
+            // No links could mean we're past the last page of results.
+            if (await isOnLastPage(page)) {
+                logger.info(`Page #${currentPage} appears to be the last one, stopping.`);
                 break;
             }
 
-            // else continue to next page..
-            await page.evaluate(selector => {
-                document.querySelector(selector).scrollIntoView({ block: 'center', inline: 'center', behavior: 'auto' });
-            }, '[aria-label="Go to next page"]');
-
-            await nextButton.click();
-            // Give the SPA time to update results
-            await sleep(400 + randomBetween(500, 1100));
-            try { await page.waitForSelector(RESULTS_CONTAINER_SELECTOR, { timeout: 10000 }); } catch (_) { }
-
-        } catch (e) {
-
-            await log(`No Next Button Found on Page #${current_page}..`);
-            break;
+            logger.warn(`Page #${currentPage} returned 0 links but 'Next' is enabled, continuing.`);
         }
-    };
 
-    await log('Bot reached the end, stopping..');
+        currentPage++;
+    }
+
+    logger.info('Bot reached the end, stopping..');
+
+    try { await browser.close(); } catch (_) { /* ignore */ }
+    await logger.close();
 };
 
-/**
- * Helper function for some computers to close out extra tabs before proceeding
- */
-const trimOpenPages = async (browser, main_page) => {
-
-    await log('');
-    await log('Checking to see if page trimming necessary..');
-
-    // Get all open pages
-    let allPages = await browser.pages();
-
-    let selected_tab = null;
-    let page_count = allPages.length;
-    if (page_count < 4) {
-
-        await log(`${page_count} Pages Open, 4 Pages Minimum, Skipping..`);
-        return await log('');
-    }
-
-    for (let i = page_count - 2; i > 0; i--) {
-
-        selected_tab = allPages[i];
-        if (selected_tab == main_page) { continue; }
-
-        // await selected_tab.waitForTimeout( 500 );
-
-        try {
-
-            await closeTab(selected_tab);
-
-        } catch (e) {
-
-            await log(`-- Closing Tab Error --`);
-            await log(`ERROR MSG - ${e.message}`);
-            await log('');
-            continue;
-        }
-    }
-
-    allPages = await browser.pages();
-    page_count = allPages.length;
-    const last_page = allPages[page_count - 1];
-
-    await last_page.bringToFront();
-    await log('Finished Trimming..');
-    return true; // await last_page.waitForTimeout( 500 );
-}
-
-const processTab = async (newTab, link, current_page, current_link) => {
-
-    await newTab.goto(link, { waitUntil: 'domcontentloaded' });
-    await humanPause(250, 600);
-
-    await findFfmError(newTab); // optionally close the "integrate your ffm" modal
-
-    try {
-        // The sporadic continue checkbox to grant permission
-
-        await newTab.waitForSelector('#application-access-grant-checkbox', { timeout: 4500 });
-        await newTab.click('#application-access-grant-checkbox');
-
-        await log('Optional Permission Checkbox Detected..');
-
-        try {
-
-            // await newTab.waitForXPath( "//button[contains(text(), 'Continue')]" );
-            await newTab.waitForSelector("xpath/.//button[contains(text(), 'Continue')]");
-
-            // <button class="_largeRoyal_15l2o_81 _m12_fthss_13297">Continue</button>
-            // /html/body/div[2]/div[4]/div[9]/div/div/div/div/div/div/div[3]/div[2]/div/div[2]/p[2]/button[2]
-            //*[@id="react-container"]/div/div/div/div/div/div/div[3]/div[2]/div/div[2]/p[2]/button[2]
-            const continueButton = await newTab.$$("xpath/.//button[contains(text(), 'Continue')]");
-            await log('Yes Continue Button Found for Permission Checkbox..');
-            await continueButton[0].click();
-
-        } catch (ee) {
-
-            await log('No Continue Button Found for Permission Checkbox..');
-        }
-
-    } catch (e) {
-
-        // await log( 'No Permission Step Detected..' ); // fail silently
-    }
-
-    try {
-        // The enable-ede step with the yellow-background
-
-        // await newTab.waitForXPath( "//button[contains(text(), 'Enable EDE')]", { timeout: 4500 });
-        await newTab.waitForSelector("xpath/.//button[contains(text(), 'Enable EDE')]", { timeout: 4500 });
-
-        // const continueButton = await newTab.$x( "//button[contains(text(), 'Enable EDE')]" );
-        const continueButton = await newTab.$$("xpath/.//button[contains(text(), 'Enable EDE')]");
-        await continueButton[0].click();
-
-        await log('Optional EDE Sync Enable Detected..');
-
-        // await newTab.waitForTimeout( 16000 );
-
-    } catch (e) {
-
-        // await log( 'No Enable EDE Step Detected..' ); // fail silently
-    }
-
-    // setTimeout( async () => {
-
-    await log(`Scrolling Tab ${current_link}..`);
-    // Scroll to the bottom of the page slowly
-    await newTab.evaluate(async () => {
-
-        await new Promise((resolve) => {
-
-            let current_iteration = 0;
-            const scrollInterval = setInterval(() => {
-
-                window.scrollBy(0, 250); // You can adjust the scroll distance here
-                current_iteration++;
-                if (document.documentElement.scrollTop + window.innerHeight >= document.documentElement.scrollHeight || current_iteration >= 10) {
-
-                    clearInterval(scrollInterval);
-                    resolve();
-                }
-            }, 100); // You can adjust the interval here
-        });
-    });
-
-    await new Promise(r => setTimeout(r, 2000));
-
-    return await closeTab(newTab, current_page, current_link);
-
-    // }, 150 );
-}
-
-const closeTab = async (tab, current_page = null, current_link = null) => {
-
-    try {
-
-        if (current_link) { await log(`Bringing Link to Front ${current_link}..`); }
-        else { await log(`Bringing Tab to Front..`); }
-
-        // await newTab.$x( "//span[contains(text(), 'Application')]", { timeout: 20000 } );
-        await tab.waitForSelector('#aca-app-coverage-details', { timeout: 20000 });
-
-        if (current_link) { await log(`-- Page #${current_page} Link #${current_link} Loaded Successfully --`); }
-        else { await log(`-- Tab Loaded Successfully --`); }
-
-    } catch (e) {
-
-        if (current_link) { await log(`-- Page #${current_page}, Link #${current_link} Failed to Load --`); }
-        else { await log(`-- Tab Failed to Load --`); }
-
-        await log(`ERROR MSG - ${e.message}`);
-        await log('');
-
-    } finally {
-
-        if (await isPageAccessible(tab)) {
-
-            await tab.bringToFront();
-
-            // await tab.waitForTimeout( 2000 );
-            await log(`Closing Tab..`);
-            await tab.close();
-        }
-
-        await log('Tab finished..');
-        await log('')
-
-        timestamp();
-        return await log('------------------------------');
-    }
-}
-
-async function isPageAccessible(page_object) {
-
-    try {
-
-        // Attempt a harmless operation to check if the page is still accessible
-        await page_object.title();
-        return true; // Page is accessible
-
-    } catch (error) {
-
-        if (error.message.includes('Target closed')) {
-
-            return false; // Page is closed
-        }
-
-        throw error; // Some other unexpected error
-    }
-    return false;
-}
-
-/** @deprecated */
-const closePreviousTab = async (browser, main_page, current_page, current_link) => {
-
-    // setTimeout( async () => {
-    // Close the new tab after waiting, throw into a setTimeout in hopes of running async
-
-    // try {
-    //     // Finding something on the page that implies the page is loaded..
-
-    //     const foundCaptcha = await newTab.$x( "//div[contains(text(), 'Recaptcha failed. Contact HealthSherpa for assistance')]", { timeout: 500 } );
-    //     if( foundCaptcha ){ log( `-- Page #${current_page}, Link #${current_link} Had Captcha --` ); }
-
-    // } catch( e ){
-
-    //     // log( `-- Page #${current_page}, Link# ${current_link} Had Captcha --` );
-    // }
-
-    try {
-        // Finding something on the page that implies the page is loaded..
-
-        // Get all open pages
-        let allPages = await browser.pages();
-
-        let selected_tab = null;
-        const page_count = allPages.length;
-        let iteration = 0;
-        while (!selected_tab) {
-
-            if (allPages[iteration] != main_page) {
-
-                selected_tab = allPages[iteration];
-
-            } else {
-
-                iteration++;
-            }
-        }
-        await log(`Targeting Tab Index: ${iteration}..`);
-        await selected_tab.bringToFront();
-
-        const on_main_page = (selected_tab == main_page);
-        console.log(selected_tab, main_page);
-        await log(on_main_page ? 'Main Page detected, not closing..' : 'Closing Tab..');
-
-        if (!on_main_page) {
-
-            // await selected_tab.waitForTimeout( 3000 );
-
-            // await newTab.$x( "//span[contains(text(), 'Application')]", { timeout: 20000 } );
-            await selected_tab.waitForSelector('#aca-app-coverage-details', { timeout: 20000 });
-            await log(`-- Page #${current_page} Link #${current_link} Loaded Successfully --`);
-            await selected_tab.close();
-        }
-
-    } catch (e) {
-
-        await log(`-- Page #${current_page}, Link #${current_link} Failed to Load --`);
-        await log(`ERROR MSG - ${e.message}`);
-        await log('');
-        // await newTab.close();
-
-    } finally {
-
-        timestamp();
-        await log('------------------------------');
-    }
-
-    // }, 500 );
-}
-
-// -- Unused snippets for selecting filters --------------------------------------------------
-
-/** @deprecated */
-const selectArchived = async (page) => {
-
-    // Wait for the div element with text 'Yes'
-    await page.waitForXPath("//div[contains(text(), 'Yes')]");
-
-    // Select the "Yes" div using the xpath
-    const yesDiv = await page.$x("//div[contains(text(), 'Yes')]");
-
-    // Click the "Yes" div
-    await yesDiv[0].click();
-}
-
-/** @deprecated */
-const selectAgency = async (page) => {
-
-    // Wait for the div element with text 'Yes'
-    await page.waitForXPath("//div[contains(text(), 'Agency')]");
-
-    // Select the "Yes" div using the xpath
-    const agencyDiv = await page.$x("//div[contains(text(), 'Agency')]");
-
-    // Click the "Yes" div
-    await agencyDiv[0].click();
-}
-
-/** @deprecated */
-const selectShared = async (page) => {
-
-    // Wait for the div element with text 'Yes'
-    await page.waitForXPath("//div[contains(text(), 'Shared')]");
-
-    // Select the "Yes" div using the xpath
-    const sharedDiv = await page.$x("//div[contains(text(), 'Shared')]");
-
-    // Click the "Yes" div
-    await sharedDiv[0].click();
-}
-
-
-sherpaRefresh();
+main().catch((err) => {
+
+    console.error('Fatal error in main():', err && err.stack ? err.stack : err);
+    process.exit(1);
+});

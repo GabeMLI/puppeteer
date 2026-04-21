@@ -1,28 +1,25 @@
 {
   "name": "puppeteer",
-  "version": "1.0.0",
-  "description": "for the automation of web scraping",
+  "version": "2.0.0",
+  "description": "HealthSherpa automation bot with memory-safe long-running pagination.",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node index.js"
   },
   "keywords": [
     "node",
     "npm",
-    "puppeteer"
+    "puppeteer",
+    "healthsherpa"
   ],
   "author": "erik white",
   "license": "ISC",
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
-    "chrome-paths": "^1.0.1",
     "dotenv": "^16.0.3",
     "puppeteer": "npm:rebrowser-puppeteer@^24.0.0",
-    "puppeteer-extra": "^3.3.4",
-    "puppeteer-extra-plugin-adblocker": "^2.13.6",
-    "puppeteer-extra-plugin-stealth": "^2.11.1",
-    "puppeteer-real-browser": "^1.4.2",
-    "random-number": "0.0.9",
-    "user-agents": "^1.0.1264"
+    "puppeteer-real-browser": "^1.4.2"
   }
 }
