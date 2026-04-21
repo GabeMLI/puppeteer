@@ -57,14 +57,32 @@ const processCurrentPage = async ({ browser, mainPage, config, logger, state, pa
         if (state.linkNumber % MEMORY_THRESHOLDS.SAMPLE_EVERY_N_LINKS === 0) {
 
             const sample = await sampleMemory(mainPage);
-            logger.info(`[memory] RSS=${sample.formatted.rss} heap=${sample.formatted.jsHeap}`);
+            logger.info(
+                `[memory] heap=${sample.formatted.jsHeap} nodes=${sample.formatted.nodes} ` +
+                `listeners=${sample.formatted.listeners} docs=${sample.formatted.documents}`,
+            );
 
             if (sample.exceeded) {
 
-                logger.warn(`[memory] threshold exceeded (RSS=${sample.formatted.rss}, heap=${sample.formatted.jsHeap}), running in-place cleanup.`);
+                const reasons = [];
+                if (sample.heapExceeded) { reasons.push(`heap=${sample.formatted.jsHeap}`); }
+                if (sample.nodesExceeded) { reasons.push(`nodes=${sample.formatted.nodes}`); }
+                if (sample.listenersExceeded) { reasons.push(`listeners=${sample.formatted.listeners}`); }
+
+                logger.warn(`[memory] threshold exceeded (${reasons.join(', ')}), running in-place cleanup.`);
                 await cleanupInPlace(mainPage, { logger, label: 'memory-threshold' });
                 cleanupTriggered = true;
             }
+        }
+
+        // Scheduled cleanup every N links regardless of thresholds. This
+        // catches slow growth that stays just under the watchdog bar but
+        // accumulates over an entire page's worth of tab open/close cycles.
+        if (state.linkNumber % MEMORY_THRESHOLDS.CLEANUP_EVERY_N_LINKS === 0) {
+
+            logger.info(`[cleanup] scheduled (every ${MEMORY_THRESHOLDS.CLEANUP_EVERY_N_LINKS} links)`);
+            await cleanupInPlace(mainPage, { logger, label: `scheduled-links-${state.linkNumber}` });
+            cleanupTriggered = true;
         }
 
         await sleep(500 + randomBetween(0, 300));

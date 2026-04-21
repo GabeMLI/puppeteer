@@ -2,7 +2,7 @@
 
 const { SELECTORS, TIMEOUTS, CLEANUP } = require('../config/constants');
 const { sleep, humanPause } = require('../core/timing');
-const { detachInterception } = require('../core/browser');
+const { attachInterception, detachInterception } = require('../core/browser');
 const { isPageAccessible } = require('../core/memory');
 const { dismissFfmModal } = require('./login');
 
@@ -132,6 +132,12 @@ const processLink = async (browser, link, { pageNumber, linkNumber, logger }) =>
     try {
 
         tab = await browser.newPage();
+
+        // Explicitly attach interception BEFORE goto. The `targetcreated`
+        // browser-level listener also attaches it, but asynchronously — so
+        // without this call, the first wave of requests (images, trackers)
+        // can slip through unblocked and inflate renderer memory.
+        await attachInterception(tab);
 
         await tab.goto(link, { waitUntil: 'domcontentloaded', timeout: TIMEOUTS.NAVIGATION });
         await humanPause(250, 600);

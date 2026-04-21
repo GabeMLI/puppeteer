@@ -36,10 +36,19 @@ const { processCurrentPage } = require('./src/flows/processPage');
 const runMemoryCheck = async ({ mainPage, logger, label }) => {
 
     const sample = await sampleMemory(mainPage);
-    logger.info(`[memory] ${label}: RSS=${sample.formatted.rss} heap=${sample.formatted.jsHeap}`);
+    logger.info(
+        `[memory] ${label}: heap=${sample.formatted.jsHeap} nodes=${sample.formatted.nodes} ` +
+        `listeners=${sample.formatted.listeners} docs=${sample.formatted.documents}`,
+    );
 
     if (sample.exceeded) {
-        logger.warn(`[memory] threshold exceeded, running in-place cleanup.`);
+
+        const reasons = [];
+        if (sample.heapExceeded) { reasons.push(`heap=${sample.formatted.jsHeap}`); }
+        if (sample.nodesExceeded) { reasons.push(`nodes=${sample.formatted.nodes}`); }
+        if (sample.listenersExceeded) { reasons.push(`listeners=${sample.formatted.listeners}`); }
+
+        logger.warn(`[memory] threshold exceeded (${reasons.join(', ')}), running in-place cleanup.`);
         await cleanupInPlace(mainPage, { logger, label: `threshold-${label}` });
         return true;
     }
@@ -131,6 +140,7 @@ const main = async () => {
         // keep the renderer's heap from drifting upward over long runs.
         if (state.pagesRan % MEMORY_THRESHOLDS.CLEANUP_EVERY_N_PAGES === 0) {
             await cleanupInPlace(page, { logger, label: `scheduled-p${currentPage}` });
+            await trimOrphanTabs(browser, page, { logger });
         } else {
             // Light-touch check after every page — logs the memory trend
             // and triggers cleanup only if thresholds are breached.

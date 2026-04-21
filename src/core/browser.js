@@ -29,29 +29,14 @@ const shouldBlockRequest = (request) => {
 };
 
 /**
- * Disable the HTTP cache for a page via CDP. This is a big long-run memory
- * win: browsers hold tens-to-hundreds of MB of MUI bundles, icons, JSON
- * responses, etc. in the disk+memory HTTP cache during a multi-hour session.
- * With caching disabled, the cache never grows in the first place.
- *
- * Cookies and sessionStorage/localStorage are untouched, so the Google auth
- * session survives intact.
- */
-const disableHttpCache = async (page) => {
-
-    try {
-
-        const client = await page.target().createCDPSession();
-        await client.send('Network.enable').catch(() => {});
-        await client.send('Network.setCacheDisabled', { cacheDisabled: true }).catch(() => {});
-        // Intentionally leave the session attached — detaching re-enables cache.
-        page.__hsCdpSession = client;
-
-    } catch (_) { /* ignore */ }
-};
-
-/**
  * Attach request interception + default timeouts to a single page.
+ *
+ * We deliberately use puppeteer's own `page.setCacheEnabled(false)` rather
+ * than opening a raw CDP session with `Network.enable` — opening a session
+ * without consuming its event stream was flooding the Node-side CDP pipe
+ * with `requestWillBeSent` / `responseReceived` / `loadingFinished` events
+ * we never read, which accumulate in the EventEmitter queue over hours.
+ *
  * The handler is stored on the page instance so it can be removed later
  * to avoid listener leaks.
  */
@@ -60,6 +45,10 @@ const attachInterception = async (page) => {
     if (page.__hsInterceptionAttached) { return; }
 
     try {
+
+        // Disable HTTP caching using puppeteer's managed session. This does
+        // NOT leave a separate CDP session attached the way our old code did.
+        try { await page.setCacheEnabled(false); } catch (_) { /* older wrappers may lack this */ }
 
         await page.setRequestInterception(true);
 
@@ -91,8 +80,6 @@ const attachInterception = async (page) => {
         page.setDefaultTimeout(TIMEOUTS.DEFAULT);
         page.setDefaultNavigationTimeout(TIMEOUTS.NAVIGATION);
 
-        await disableHttpCache(page);
-
     } catch (err) {
 
         // If interception fails (target already closed etc.), don't crash.
@@ -114,15 +101,10 @@ const detachInterception = (page) => {
             page.off('request', page.__hsInterceptionHandler);
         }
 
-        page.removeAllListeners('request');
+        // Do NOT call page.removeAllListeners('request') here — puppeteer
+        // itself registers internal listeners we must not strip.
 
     } catch (_) { /* ignore */ }
-
-    // Detach the CDP session held for cache control, if any.
-    if (page.__hsCdpSession) {
-        try { page.__hsCdpSession.detach().catch(() => {}); } catch (_) { /* ignore */ }
-        page.__hsCdpSession = null;
-    }
 
     page.__hsInterceptionHandler = null;
     page.__hsInterceptionAttached = false;

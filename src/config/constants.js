@@ -110,11 +110,21 @@ const BLOCKED_URL_PATTERNS = Object.freeze([
 ]);
 
 // Memory watchdog thresholds — when exceeded, run cleanupInPlace.
+//
+// IMPORTANT: `process.memoryUsage().rss` is the NODE bot's RSS, not Chrome's.
+// Chrome memory is what actually leaks, so all of the triggers below are
+// based on Chromium-side signals read via `page.metrics()`:
+//   - JS_HEAP_BYTES:       renderer JS heap ceiling before forced cleanup
+//   - DOM_NODES:           total DOM nodes — MUI DataGrid virtualization leaks
+//                          manifest here. 25k+ means rows aren't being recycled.
+//   - JS_EVENT_LISTENERS:  React effect leaks show up as climbing listener counts.
 const MEMORY_THRESHOLDS = Object.freeze({
-    RSS_BYTES: 1_500 * 1024 * 1024,           // 1.5 GB process RSS
-    JS_HEAP_BYTES: 500 * 1024 * 1024,          // 500 MB JS heap on main tab
-    SAMPLE_EVERY_N_LINKS: 10,                  // how often to sample memory during link processing
-    CLEANUP_EVERY_N_PAGES: 20,                 // scheduled cleanup cadence during processing phase
+    JS_HEAP_BYTES: 250 * 1024 * 1024,          // 250 MB JS heap on main tab
+    DOM_NODES: 25_000,
+    JS_EVENT_LISTENERS: 15_000,
+    SAMPLE_EVERY_N_LINKS: 5,                   // how often to sample memory during link processing
+    CLEANUP_EVERY_N_LINKS: 25,                 // scheduled cleanup cadence inside a page (links)
+    CLEANUP_EVERY_N_PAGES: 5,                  // scheduled cleanup cadence during processing phase
     // Skip phase is the most memory-hostile one (159 rapid clicks back-to-back
     // with no time to breathe). Everything here is intentionally more aggressive.
     SKIP_CLEANUP_EVERY_N_PAGES: 5,

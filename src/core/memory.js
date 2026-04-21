@@ -43,22 +43,37 @@ const isPageAccessible = async (page) => {
 };
 
 /**
- * Sample current JS heap from a page without creating persistent CDP sessions.
- * Returns 0 on failure.
+ * Sample current renderer metrics from a page without creating persistent
+ * CDP sessions. Returns zeros on failure.
+ *
+ * `page.metrics()` returns the metrics of the **Chromium renderer** for the
+ * given page — which is what we actually care about. `process.memoryUsage()`
+ * only reports the Node-side footprint, which stays tiny and is useless
+ * for detecting Chrome leaks.
  */
-const getPageJsHeapBytes = async (page) => {
+const getPageMetrics = async (page) => {
 
     try {
 
         const metrics = await page.metrics();
-        return metrics && Number.isFinite(metrics.JSHeapUsedSize)
-            ? metrics.JSHeapUsedSize
-            : 0;
+        if (!metrics) {
+            return { jsHeap: 0, nodes: 0, listeners: 0, documents: 0 };
+        }
+
+        return {
+            jsHeap: Number.isFinite(metrics.JSHeapUsedSize) ? metrics.JSHeapUsedSize : 0,
+            nodes: Number.isFinite(metrics.Nodes) ? metrics.Nodes : 0,
+            listeners: Number.isFinite(metrics.JSEventListeners) ? metrics.JSEventListeners : 0,
+            documents: Number.isFinite(metrics.Documents) ? metrics.Documents : 0,
+        };
 
     } catch (_) {
-        return 0;
+        return { jsHeap: 0, nodes: 0, listeners: 0, documents: 0 };
     }
 };
+
+// Back-compat alias — some callers only need the heap number.
+const getPageJsHeapBytes = async (page) => (await getPageMetrics(page)).jsHeap;
 
 /**
  * In-place memory cleanup. Runs the renderer-side garbage collector and
@@ -162,23 +177,43 @@ const cleanupInPlace = async (page, { logger, label = 'cleanup' } = {}) => {
 };
 
 /**
- * Inspect memory usage and return whether thresholds are exceeded, along
- * with the sampled values (useful for logging and decision-making).
+ * Inspect memory usage of the page's Chromium renderer (not Node!).
+ *
+ * `process.memoryUsage().rss` is reported for visibility only — it is NOT
+ * used for threshold decisions because it reflects the Node bot process,
+ * not Chrome, and therefore never reacts to the Chrome-side leak that
+ * actually causes "Aw, Snap!" and progressive slowdown.
+ *
+ * The real signal we watch is:
+ *   - jsHeap    : renderer JS heap (trigger cleanup when high)
+ *   - nodes     : DOM nodes — climbs when MUI's DataGrid fails to recycle
+ *   - listeners : DOM event listeners — climbs if React effects leak
  */
 const sampleMemory = async (page) => {
 
     const rss = process.memoryUsage().rss;
-    const jsHeap = await getPageJsHeapBytes(page);
+    const { jsHeap, nodes, listeners, documents } = await getPageMetrics(page);
+
+    const heapExceeded = jsHeap >= MEMORY_THRESHOLDS.JS_HEAP_BYTES;
+    const nodesExceeded = nodes >= MEMORY_THRESHOLDS.DOM_NODES;
+    const listenersExceeded = listeners >= MEMORY_THRESHOLDS.JS_EVENT_LISTENERS;
 
     return {
         rss,
         jsHeap,
-        rssExceeded: rss >= MEMORY_THRESHOLDS.RSS_BYTES,
-        heapExceeded: jsHeap >= MEMORY_THRESHOLDS.JS_HEAP_BYTES,
-        exceeded: rss >= MEMORY_THRESHOLDS.RSS_BYTES || jsHeap >= MEMORY_THRESHOLDS.JS_HEAP_BYTES,
+        nodes,
+        listeners,
+        documents,
+        heapExceeded,
+        nodesExceeded,
+        listenersExceeded,
+        exceeded: heapExceeded || nodesExceeded || listenersExceeded,
         formatted: {
             rss: formatBytes(rss),
             jsHeap: formatBytes(jsHeap),
+            nodes: String(nodes),
+            listeners: String(listeners),
+            documents: String(documents),
         },
     };
 };
@@ -255,7 +290,11 @@ const logPageDiagnostics = async (page, { logger, label = 'diagnostic' } = {}) =
         ]);
 
         logger.warn(`[${label}] title="${title}" url="${url}"`);
-        logger.warn(`[${label}] RSS=${sample.formatted.rss} heap=${sample.formatted.jsHeap}`);
+        logger.warn(
+            `[${label}] heap=${sample.formatted.jsHeap} nodes=${sample.formatted.nodes} ` +
+            `listeners=${sample.formatted.listeners} docs=${sample.formatted.documents} ` +
+            `(node-rss=${sample.formatted.rss})`,
+        );
 
     } catch (err) {
 
