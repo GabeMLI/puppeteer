@@ -130,7 +130,13 @@ const BLOCKED_URL_PATTERNS = Object.freeze([
 //   - JS_EVENT_LISTENERS:  React effect leaks show up as climbing listener counts.
 const MEMORY_THRESHOLDS = Object.freeze({
     JS_HEAP_BYTES: 250 * 1024 * 1024,          // 250 MB JS heap → in-place cleanup
-    JS_HEAP_BYTES_CRITICAL: 900 * 1024 * 1024, // 900 MB JS heap → hard reset (see HARD_RESET below)
+    // Hard reset is expensive (~5-8 min of re-skip per trigger) and only
+    // partially effective because the DataGrid row-retention leak re-builds
+    // during the re-skip.  We therefore only trigger it when the heap is
+    // close enough to V8's configured ceiling (default 8 GB) that continuing
+    // without it would likely OOM.  3.5 GB leaves ~4.5 GB of headroom —
+    // enough to absorb a few more pages and finish the run most of the time.
+    JS_HEAP_BYTES_CRITICAL: 3_500 * 1024 * 1024, // 3.5 GB JS heap → hard reset (emergency)
     DOM_NODES: 25_000,
     JS_EVENT_LISTENERS: 15_000,
     SAMPLE_EVERY_N_LINKS: 5,                   // how often to sample memory during link processing
@@ -147,11 +153,21 @@ const MEMORY_THRESHOLDS = Object.freeze({
 // then click-skip back to the page we were on.  Cookies survive the reload,
 // so the Google auth session does NOT need to be re-entered.
 //
-// This is the only effective way to recover from a leaked-references heap
-// (e.g. MUI DataGrid retaining rows from prior pages) where `cleanupInPlace`
-// can only free a tiny fraction because the objects are still "live".
+// IMPORTANT caveat: the MUI DataGrid row-retention leak RE-BUILDS during
+// the re-skip (every skipped page loads rows that the grid then retains),
+// so the reset only recovers the portion of the heap that came from child
+// tab cycles (processLink). That's typically ~500-700 MB out of a 1.5 GB
+// heap — not nothing, but not a miracle either.
+//
+// Defaults below reflect that trade-off:
+//   - EVERY_N_PAGES = 0 : no preventive resets. The reset will only fire
+//     if JS_HEAP_BYTES_CRITICAL is crossed, i.e. in an actual emergency
+//     where continuing would probably OOM.
+//   - Set EVERY_N_PAGES to a positive number via HARD_RESET_EVERY_N_PAGES
+//     in .env if you have a very long run (>500 pages) and want periodic
+//     trimming even at the cost of re-skip time.
 const HARD_RESET = Object.freeze({
-    EVERY_N_PAGES: 75,                         // preventive reload cadence (0 = disabled)
+    EVERY_N_PAGES: 0,                          // preventive reload cadence (0 = disabled, emergency-only)
     POST_RELOAD_WAIT_MS: 3_000,                // breather after reload before re-skip starts
 });
 
