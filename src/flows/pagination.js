@@ -131,8 +131,7 @@ const gotoNextPage = async (page, { logger, clickDelay, attempts } = {}) => {
  * `onInterval(currentPage)` may return:
  *   - undefined / nothing    → continue skipping normally
  *   - `{ abort: true, reason }` → stop the skip right here. The function
- *     returns the page reached so the caller can decide what to do
- *     (typically: hard-reset and restart the skip fresh from page 1).
+ *     returns the page reached so the caller can decide what to do.
  *
  * Returns the actual page reached (may be less than targetPage if the
  * Next button became disabled, clicks stopped working, or onInterval

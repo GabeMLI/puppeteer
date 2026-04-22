@@ -130,12 +130,6 @@ const BLOCKED_URL_PATTERNS = Object.freeze([
 //   - JS_EVENT_LISTENERS:  React effect leaks show up as climbing listener counts.
 const MEMORY_THRESHOLDS = Object.freeze({
     JS_HEAP_BYTES: 250 * 1024 * 1024,          // 250 MB JS heap → in-place cleanup
-    // NOTE: JS_HEAP_BYTES_CRITICAL is *computed* at runtime from the V8 heap
-    // ceiling (see env.js), because an absolute number doesn't make sense:
-    // it must always be a fraction of the actual ceiling to leave headroom
-    // for the heap spike that the hard reset itself causes mid-reset.
-    // Config exposes it as `config.memory.jsHeapBytesCritical`.
-    JS_HEAP_BYTES_CRITICAL_FRACTION: 0.75,     // 75% of V8 max-old-space-size
     DOM_NODES: 25_000,
     JS_EVENT_LISTENERS: 15_000,
     SAMPLE_EVERY_N_LINKS: 5,                   // how often to sample memory during link processing
@@ -153,28 +147,6 @@ const MEMORY_THRESHOLDS = Object.freeze({
     SKIP_CLEANUP_EVERY_N_PAGES: 2,
     SKIP_CLICK_DELAY_MIN_MS: 2_000,
     SKIP_CLICK_DELAY_MAX_MS: 3_500,
-});
-
-// Hard-reset = reload the main page to drop the accumulated renderer heap,
-// then click-skip back to the page we were on.  Cookies survive the reload,
-// so the Google auth session does NOT need to be re-entered.
-//
-// IMPORTANT caveat: the MUI DataGrid row-retention leak RE-BUILDS during
-// the re-skip (every skipped page loads rows that the grid then retains),
-// so the reset only recovers the portion of the heap that came from child
-// tab cycles (processLink). That's typically ~500-700 MB out of a 1.5 GB
-// heap — not nothing, but not a miracle either.
-//
-// Defaults below reflect that trade-off:
-//   - EVERY_N_PAGES = 0 : no preventive resets. The reset will only fire
-//     if JS_HEAP_BYTES_CRITICAL is crossed, i.e. in an actual emergency
-//     where continuing would probably OOM.
-//   - Set EVERY_N_PAGES to a positive number via HARD_RESET_EVERY_N_PAGES
-//     in .env if you have a very long run (>500 pages) and want periodic
-//     trimming even at the cost of re-skip time.
-const HARD_RESET = Object.freeze({
-    EVERY_N_PAGES: 0,                          // preventive reload cadence (0 = disabled, emergency-only)
-    POST_RELOAD_WAIT_MS: 3_000,                // breather after reload before re-skip starts
 });
 
 // Retry behaviour when the "Next page" click fails to re-render the grid.
@@ -237,5 +209,4 @@ module.exports = {
     LOG_FILE_NAME,
     DEFAULT_MAX_OLD_SPACE_MB,
     DEFAULT_BROWSER_FLAGS,
-    HARD_RESET,
 };

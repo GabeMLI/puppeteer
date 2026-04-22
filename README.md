@@ -80,15 +80,6 @@ never lost — are:
 - **Scheduled cleanup** — once per `CLEANUP_EVERY_N_PAGES` pages the
   bot runs `cleanupInPlace` unconditionally, so the renderer's heap
   doesn't drift upward over long runs.
-- **Emergency hard reset** — when the renderer JS heap crosses 3.5 GB
-  (close to the 8 GB V8 ceiling), the bot navigates the main tab through
-  `about:blank` + re-visits the filtered list URL, then re-skips to the
-  current page.  Cookies survive the reload, so the Google auth session
-  is not lost.  This is a safety net, not a routine operation — the
-  re-skip itself re-builds part of the heap (DataGrid row-retention leak)
-  so it only recovers ~500-700 MB out of a 1.5 GB heap.  Set
-  `HARD_RESET_EVERY_N_PAGES` to a positive integer to also run it
-  preventively every N pages (useful only for runs over ~500 pages).
 - **Raised V8 heap ceiling** — `--js-flags=--max-old-space-size=N` raises
   Chromium's per-renderer heap limit from the default 2-4 GB to 8 GB
   (configurable via `MAX_OLD_SPACE_SIZE_MB`). Switching to Edge/Chrome
@@ -130,7 +121,6 @@ can be tuned without touching the flow code.
 | `BROWSER_EXECUTABLE_PATH`  | Full override path to the browser binary                                                         |
 | `MAX_OLD_SPACE_SIZE_MB`    | V8 heap ceiling per renderer (default `8192`). Raise on machines with 32 GB+ RAM, lower on 8 GB  |
 | `EXTRA_BROWSER_FLAGS`      | Comma-separated extra Chromium launch flags                                                      |
-| `HARD_RESET_EVERY_N_PAGES` | Preventive reload-and-reskip every N pages (default `0` = disabled, emergency-only)              |
 | `FILTER_*`, `STATE_*`      | Result filters — see `.env.example` for the full catalogue                                       |
 
 `.env.example` documents every option and is kept in sync with the code.
