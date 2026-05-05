@@ -50,6 +50,8 @@ const SELECTORS = Object.freeze({
     PERMISSION_CHECKBOX: '#application-access-grant-checkbox',
     CONTINUE_BUTTON_XPATH: "xpath/.//button[contains(text(), 'Continue')]",
     ENABLE_EDE_BUTTON_XPATH: "xpath/.//button[contains(text(), 'Enable EDE')]",
+    RECONNECT_BUTTON_OR_LINK_XPATH:
+        "xpath/.//*[self::button or self::a][normalize-space(.)='Reconnect']",
     APP_COVERAGE_DETAILS: '#aca-app-coverage-details',
 });
 
@@ -61,6 +63,7 @@ const TIMEOUTS = Object.freeze({
     FFM_MODAL: 3_000,
     PERMISSION_CHECKBOX: 4_500,
     ENABLE_EDE: 4_500,
+    RECONNECT: 4_500,
     APP_COVERAGE_DETAILS: 20_000,
 });
 

@@ -58,6 +58,27 @@ const handleEnableEde = async (tab, { logger }) => {
 };
 
 /**
+ * Optional yellow-banner step: consumer withdrew consent — click Reconnect.
+ */
+const handleReconnectConsent = async (tab, { logger }) => {
+
+    try {
+
+        await tab.waitForSelector(SELECTORS.RECONNECT_BUTTON_OR_LINK_XPATH, { timeout: TIMEOUTS.RECONNECT });
+
+        const els = await tab.$$(SELECTORS.RECONNECT_BUTTON_OR_LINK_XPATH);
+        if (els.length > 0) {
+            await els[0].click().catch(() => {});
+            if (logger) { logger.info('Reconnect (consent withdrawn banner) clicked..'); }
+            await humanPause(400, 900);
+        }
+
+    } catch (_) {
+        // Banner not shown — common case.
+    }
+};
+
+/**
  * Slow, bounded scroll to trigger lazy loads HealthSherpa relies on.
  * Capped at SCROLL_MAX_ITERATIONS steps so a misbehaving page can't spin
  * this forever.
@@ -145,6 +166,7 @@ const processLink = async (browser, link, { pageNumber, linkNumber, logger }) =>
         await dismissFfmModal(tab, { logger });
         await handlePermissionPrompt(tab, { logger });
         await handleEnableEde(tab, { logger });
+        await handleReconnectConsent(tab, { logger });
 
         if (logger) { logger.info(`Scrolling Tab ${linkNumber}..`); }
         await slowScrollToBottom(tab);
